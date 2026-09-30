@@ -90,7 +90,7 @@ pub struct EngineConfig {
     pub stream: bool,
     pub prompt: Option<String>,
     pub sampling: String,
-    #[serde(default)]
+    #[serde(default, alias = "extra_body")]
     pub extra: Map<String, Value>,
     #[serde(flatten, skip_serializing)]
     pub(crate) unknown: Map<String, Value>,
