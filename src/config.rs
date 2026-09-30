@@ -476,6 +476,20 @@ mod tests {
         assert!(Config::default().merge_enabled);
         assert_eq!(Config::default().merge_length, 300_000);
 
+        let passthrough: Config = serde_json::from_str(
+            r#"{"engines":{"openai":{"extra_body":{"thinking":{"type":"disabled"},"enable_thinking":false}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            passthrough
+                .engines
+                .get("openai")
+                .unwrap()
+                .extra
+                .get("enable_thinking"),
+            Some(&serde_json::json!(false))
+        );
+
         let mut typo: Config =
             serde_json::from_str(r#"{"engines":{"openai":{"temprature":0.2}}}"#).unwrap();
         assert!(typo.adopt_flat_engines().is_err());
