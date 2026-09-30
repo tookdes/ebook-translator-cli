@@ -597,9 +597,7 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 };
                 for attr in event.attributes() {
                     let attr = attr?;
-                    let value = attr
-                        .normalized_value(XmlVersion::Implicit1_0)?
-                        .into_owned();
+                    let value = attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
                     match attr.key.local_name().as_ref() {
                         b"id" => item.id = value,
                         b"href" => item.href = value,
@@ -619,10 +617,8 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"idref" {
-                        spine_ids.push(
-                            attr.normalized_value(XmlVersion::Implicit1_0)?
-                                .into_owned(),
-                        );
+                        spine_ids
+                            .push(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                     }
                 }
             }
@@ -630,9 +626,8 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"toc" {
-                        package.spine_toc = attr
-                            .normalized_value(XmlVersion::Implicit1_0)?
-                            .into_owned();
+                        package.spine_toc =
+                            attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
                     }
                 }
             }
