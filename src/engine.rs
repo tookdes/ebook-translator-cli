@@ -6,10 +6,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, Response, Url, redirect};
+use reqwest::{Client, RequestBuilder, Response, Url, redirect};
 use serde_json::{Map, Value, json};
 
 use crate::config::EngineConfig;
+
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineKind {
@@ -35,6 +38,7 @@ impl fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 pub struct Engine {
+    pub name: String,
     pub kind: EngineKind,
     pub config: EngineConfig,
     pub endpoint: Url,
@@ -127,6 +131,7 @@ impl Engine {
             }))
             .build()?;
         Ok(Self {
+            name: name.into(),
             kind,
             config,
             endpoint,
@@ -153,23 +158,12 @@ impl Engine {
             .replace("<tlang>", &self.target_lang)
             .replace("<slang>", source_lang);
         let body = self.body(text, &prompt, self.config.stream)?;
-        let mut request = self
-            .client
-            .post(self.endpoint.clone())
-            .json(&body)
-            .header("content-type", "application/json");
-        request = match self.kind {
-            EngineKind::Claude => request
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", "2023-06-01"),
-            _ => request.bearer_auth(&self.config.api_key),
-        };
-        let response = request.send().await?;
+        let response = self.request(&body).send().await?;
         let response = check_status(response).await?;
         let result = if self.config.stream {
             self.parse_stream(response).await?
         } else {
-            self.parse_response(response.json().await?).await?
+            self.parse_response(read_json_limited(response).await?).await?
         };
         let result = result.trim().to_owned();
         if !result.is_empty() {
@@ -180,18 +174,12 @@ impl Engine {
         for strategy in thinking_disable_strategies() {
             let mut retry_body = body.clone();
             apply_thinking_strategy(&mut retry_body, strategy);
-            let response = self
-                .client
-                .post(self.endpoint.clone())
-                .json(&retry_body)
-                .header("content-type", "application/json")
-                .send()
-                .await?;
+            let response = self.request(&retry_body).send().await?;
             let response = check_status(response).await?;
             let result = if self.config.stream {
                 self.parse_stream(response).await?
             } else {
-                self.parse_response(response.json().await?).await?
+                self.parse_response(read_json_limited(response).await?).await?
             };
             let result = result.trim().to_owned();
             if !result.is_empty() {
@@ -199,6 +187,20 @@ impl Engine {
             }
         }
         bail!("API 返回空译文")
+    }
+
+    fn request(&self, body: &Value) -> RequestBuilder {
+        let request = self
+            .client
+            .post(self.endpoint.clone())
+            .json(body)
+            .header("content-type", "application/json");
+        match self.kind {
+            EngineKind::Claude => request
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", "2023-06-01"),
+            _ => request.bearer_auth(&self.config.api_key),
+        }
     }
 
     async fn translate_deeplx(&self, text: &str) -> Result<String> {
@@ -227,7 +229,7 @@ impl Engine {
         }
         let response = request.send().await?;
         let response = check_status(response).await?;
-        let data: Value = response.json().await?;
+        let data = read_json_limited(response).await?;
         let text = data
             .get("data")
             .and_then(|data| match data {
@@ -343,9 +345,6 @@ impl Engine {
                     .flatten()
                     .filter_map(|block| block.get("text").and_then(Value::as_str))
                     .collect::<String>();
-                if text.is_empty() {
-                    bail!("API 返回空结果: {}", truncate_json(&data));
-                }
                 Ok(text)
             }
             _ => {
@@ -372,9 +371,7 @@ impl Engine {
                             .map(extract_tail_translation)
                     })
                     .or_else(|| choice.get("text").and_then(Value::as_str).map(str::to_owned));
-                content
-                    .filter(|x| !x.trim().is_empty())
-                    .ok_or_else(|| anyhow!("API 返回空译文: {}", truncate_json(&data)))
+                Ok(content.unwrap_or_default())
             }
         }
     }
@@ -385,9 +382,15 @@ impl Engine {
         let mut pending = String::new();
         let mut output = String::new();
         let mut completed = false;
+        let mut received = 0usize;
         while let Some(chunk) = bytes.next().await {
+            let chunk = chunk?;
+            received = received.saturating_add(chunk.len());
+            if received > MAX_RESPONSE_BYTES {
+                bail!("API 响应过大（超过 {} MiB）", MAX_RESPONSE_BYTES / 1024 / 1024);
+            }
             // 网络分块边界可能落在多字节 UTF-8 序列中间,残缺尾部留在 buf 等下一块。
-            buf.extend_from_slice(&chunk?);
+            buf.extend_from_slice(&chunk);
             drain_valid_utf8(&mut buf, &mut pending)?;
             while let Some(pos) = pending.find('\n') {
                 let line = pending[..pos].trim_end_matches('\r').trim().to_owned();
@@ -498,6 +501,27 @@ fn drain_valid_utf8(buf: &mut Vec<u8>, pending: &mut String) -> Result<()> {
     Ok(())
 }
 
+async fn read_bytes_limited(response: Response, limit: usize) -> Result<Vec<u8>> {
+    if response.content_length().is_some_and(|length| length > limit as u64) {
+        bail!("API 响应过大（上限 {} 字节）", limit);
+    }
+    let mut stream = response.bytes_stream();
+    let mut output = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if output.len().saturating_add(chunk.len()) > limit {
+            bail!("API 响应过大（上限 {} 字节）", limit);
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
+}
+
+async fn read_json_limited(response: Response) -> Result<Value> {
+    let bytes = read_bytes_limited(response, MAX_RESPONSE_BYTES).await?;
+    serde_json::from_slice(&bytes).context("API 响应 JSON 无效")
+}
+
 async fn check_status(response: Response) -> Result<Response> {
     if response.status().is_success() {
         return Ok(response);
@@ -508,7 +532,10 @@ async fn check_status(response: Response) -> Result<Response> {
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_retry_after);
-    let body = response.text().await.unwrap_or_default();
+    let body = read_bytes_limited(response, MAX_ERROR_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body);
     Err(ApiError {
         status: Some(status),
         retry_after,
@@ -732,6 +759,44 @@ fn truncate_json(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn common_request_builder_keeps_auth_headers() {
+        let openai = Engine::new(
+            "openai",
+            EngineConfig {
+                api_key: "openai-secret".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                ..Default::default()
+            },
+            "English",
+            "Chinese",
+        )
+        .unwrap();
+        let request = openai.request(&json!({})).build().unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer openai-secret"
+        );
+
+        let claude = Engine::new(
+            "claude",
+            EngineConfig {
+                api_key: "claude-secret".into(),
+                base_url: "http://127.0.0.1:9".into(),
+                ..Default::default()
+            },
+            "English",
+            "Chinese",
+        )
+        .unwrap();
+        let request = claude.request(&json!({})).build().unwrap();
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "claude-secret");
+        assert_eq!(
+            request.headers().get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
+    }
 
     fn cfg(base_url: &str) -> EngineConfig {
         EngineConfig {
