@@ -363,10 +363,12 @@ async fn translate_book(
     let convert_input = input.to_owned();
     let converter = config.ebook_convert_path.clone();
     let encoding = (!config.input_encoding.is_empty()).then(|| config.input_encoding.clone());
-    let converted = convert_to_epub(&convert_input, &converter, encoding.as_deref()).context("格式转换失败")?;
+    let converted =
+        convert_to_epub(&convert_input, &converter, encoding.as_deref()).context("格式转换失败")?;
     let epub_path = converted.path.clone();
     let extraction_config = config.clone();
-    let (elements, meta) = extract_from_epub(&epub_path, &extraction_config).context("EPUB 解析失败")?;
+    let (elements, meta) =
+        extract_from_epub(&epub_path, &extraction_config).context("EPUB 解析失败")?;
     if elements.is_empty() {
         eprintln!("  未找到可翻译内容: {}", input.display());
         return Ok(false);

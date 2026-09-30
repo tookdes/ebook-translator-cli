@@ -310,8 +310,9 @@ mod tests {
                    ignored INTEGER DEFAULT 0, attributes TEXT, page TEXT,
                    translation TEXT, engine_name TEXT, target_lang TEXT
                  );
-                 CREATE TABLE info (key TEXT UNIQUE, value TEXT);"
-            ).unwrap();
+                 CREATE TABLE info (key TEXT UNIQUE, value TEXT);",
+            )
+            .unwrap();
         }
         let cache = TranslationCache::open(&path, true).unwrap();
         let mut first = row("a", false);

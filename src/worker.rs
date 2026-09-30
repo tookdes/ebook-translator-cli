@@ -115,8 +115,6 @@ impl TranslationWorker {
         }
     }
 
-
-
     pub fn with_fallback(mut self, engine: Engine) -> Self {
         self.fallback.push(EngineRuntime::new(engine));
         self
@@ -256,9 +254,7 @@ impl TranslationWorker {
         match merged {
             Ok(translations) => Ok(translations),
             Err(error) => {
-                self.message(format!(
-                    "  合并翻译失败（{error:#}），回退逐段"
-                ));
+                self.message(format!("  合并翻译失败（{error:#}），回退逐段"));
                 let mut fallback = HashMap::new();
                 for paragraph in group {
                     fallback.insert(
@@ -282,7 +278,11 @@ impl TranslationWorker {
             .as_array()
             .ok_or_else(|| anyhow!("合并译文不是 JSON 数组"))?;
         if items.len() != group.len() {
-            bail!("合并译文数量不匹配：预期 {}，实际 {}", group.len(), items.len());
+            bail!(
+                "合并译文数量不匹配：预期 {}，实际 {}",
+                group.len(),
+                items.len()
+            );
         }
         let expected = group
             .iter()
@@ -382,7 +382,7 @@ impl TranslationWorker {
                     return Ok(TranslationOutcome {
                         text: translation,
                         engine_name: runtime.engine.name.clone(),
-                    })
+                    });
                 }
                 Err(error) if attempt == 0 && has_markup => {
                     self.message(format!("  模型损坏 HTML 占位符，自动重试一次: {error}"));
@@ -394,7 +394,11 @@ impl TranslationWorker {
     }
 
     fn prompt_for<'a>(&'a self, engine: &'a Engine) -> &'a str {
-        engine.config.prompt.as_deref().unwrap_or(&self.config.prompt)
+        engine
+            .config
+            .prompt
+            .as_deref()
+            .unwrap_or(&self.config.prompt)
     }
 
     async fn translate_one_with(
@@ -412,13 +416,11 @@ impl TranslationWorker {
                 bail!("翻译批次已停止");
             }
             let attempt_timeout = Duration::from_secs_f64(config.request_timeout);
-            let translated = tokio::time::timeout(
-                attempt_timeout,
-                runtime.engine.translate(text, prompt),
-            )
-            .await
-            .map_err(|_| anyhow!("请求超时（{attempt_timeout:?}）"))
-            .and_then(|result| result);
+            let translated =
+                tokio::time::timeout(attempt_timeout, runtime.engine.translate(text, prompt))
+                    .await
+                    .map_err(|_| anyhow!("请求超时（{attempt_timeout:?}）"))
+                    .and_then(|result| result);
             drop(permit);
             match translated {
                 Ok(result) if !result.trim().is_empty() => return Ok(result),
@@ -456,9 +458,8 @@ impl TranslationWorker {
                         }
                         _ => Duration::from_secs_f64(config.retry_delay * attempt as f64),
                     };
-                    let wait = retry_after.unwrap_or_else(|| {
-                        base.mul_f64(rand::rng().random_range(0.5..1.5))
-                    });
+                    let wait = retry_after
+                        .unwrap_or_else(|| base.mul_f64(rand::rng().random_range(0.5..1.5)));
                     if kind == ErrorKind::RateLimit {
                         runtime.limiter.defer(wait).await;
                     }
@@ -500,7 +501,6 @@ fn protected_prompt(prompt: &str, has_markup: bool, has_glossary: bool) -> Strin
         tokens.join(" and ")
     )
 }
-
 
 fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Vec<Paragraph>> {
     if !enabled || limit == 0 {

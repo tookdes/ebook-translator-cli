@@ -163,7 +163,8 @@ impl Engine {
         let result = if self.config.stream {
             self.parse_stream(response).await?
         } else {
-            self.parse_response(read_json_limited(response).await?).await?
+            self.parse_response(read_json_limited(response).await?)
+                .await?
         };
         let result = result.trim().to_owned();
         if !result.is_empty() {
@@ -217,15 +218,12 @@ impl Engine {
             .get("data")
             .and_then(|data| match data {
                 Value::String(value) => Some(value.as_str()),
-                _ => data
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        data.get("translations")
-                            .and_then(Value::as_array)
-                            .and_then(|items| items.first())
-                            .and_then(|item| item.get("text").and_then(Value::as_str))
-                    }),
+                _ => data.get("text").and_then(Value::as_str).or_else(|| {
+                    data.get("translations")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("text").and_then(Value::as_str))
+                }),
             })
             .or_else(|| data.get("text").and_then(Value::as_str))
             .ok_or_else(|| anyhow!("DeepLX 返回格式无法识别: {}", truncate_json(&data)))?;
@@ -353,7 +351,12 @@ impl Engine {
                             .and_then(Value::as_str)
                             .map(extract_tail_translation)
                     })
-                    .or_else(|| choice.get("text").and_then(Value::as_str).map(str::to_owned));
+                    .or_else(|| {
+                        choice
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
                 Ok(content.unwrap_or_default())
             }
         }
@@ -370,7 +373,10 @@ impl Engine {
             let chunk = chunk?;
             received = received.saturating_add(chunk.len());
             if received > MAX_RESPONSE_BYTES {
-                bail!("API 响应过大（超过 {} MiB）", MAX_RESPONSE_BYTES / 1024 / 1024);
+                bail!(
+                    "API 响应过大（超过 {} MiB）",
+                    MAX_RESPONSE_BYTES / 1024 / 1024
+                );
             }
             // 网络分块边界可能落在多字节 UTF-8 序列中间,残缺尾部留在 buf 等下一块。
             buf.extend_from_slice(&chunk);
@@ -448,7 +454,10 @@ fn drain_valid_utf8(buf: &mut Vec<u8>, pending: &mut String) -> Result<()> {
 }
 
 async fn read_bytes_limited(response: Response, limit: usize) -> Result<Vec<u8>> {
-    if response.content_length().is_some_and(|length| length > limit as u64) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
         bail!("API 响应过大（上限 {} 字节）", limit);
     }
     let mut stream = response.bytes_stream();
@@ -594,10 +603,48 @@ pub fn deepl_lang(language: &str) -> String {
     };
     if matches!(
         code.as_str(),
-        "zh" | "en" | "ja" | "ko" | "fr" | "de" | "es" | "pt" | "it" | "ru" | "ar" | "nl"
-            | "pl" | "tr" | "vi" | "id" | "th" | "hi" | "uk" | "el" | "sv" | "nb" | "fi"
-            | "cs" | "ro" | "hu" | "bg" | "da" | "sk" | "sl" | "lt" | "lv" | "et" | "hr"
-            | "sr" | "he" | "fa" | "ur" | "bn" | "ta" | "ms" | "ca" | "cy"
+        "zh" | "en"
+            | "ja"
+            | "ko"
+            | "fr"
+            | "de"
+            | "es"
+            | "pt"
+            | "it"
+            | "ru"
+            | "ar"
+            | "nl"
+            | "pl"
+            | "tr"
+            | "vi"
+            | "id"
+            | "th"
+            | "hi"
+            | "uk"
+            | "el"
+            | "sv"
+            | "nb"
+            | "fi"
+            | "cs"
+            | "ro"
+            | "hu"
+            | "bg"
+            | "da"
+            | "sk"
+            | "sl"
+            | "lt"
+            | "lv"
+            | "et"
+            | "hr"
+            | "sr"
+            | "he"
+            | "fa"
+            | "ur"
+            | "bn"
+            | "ta"
+            | "ms"
+            | "ca"
+            | "cy"
     ) {
         code.to_ascii_uppercase()
     } else if code.eq_ignore_ascii_case("auto")

@@ -322,7 +322,10 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.engine.as_str(), "openai" | "deepseek" | "claude" | "deeplx" | "deepx") {
+        if !matches!(
+            self.engine.as_str(),
+            "openai" | "deepseek" | "claude" | "deeplx" | "deepx"
+        ) {
             bail!(
                 "未知引擎 '{}'，可用: claude, deepseek, openai, deeplx, deepx",
                 self.engine
@@ -378,7 +381,10 @@ impl Config {
             bail!("max_error_count 必须大于 0");
         }
         for (name, cfg) in &self.engines {
-            if !matches!(name.as_str(), "openai" | "deepseek" | "claude" | "deeplx" | "deepx") {
+            if !matches!(
+                name.as_str(),
+                "openai" | "deepseek" | "claude" | "deeplx" | "deepx"
+            ) {
                 bail!("未知引擎 '{name}'，可用: claude, deepseek, openai, deeplx, deepx");
             }
             if cfg.concurrency == 0 || cfg.concurrency > MAX_CONCURRENCY {
