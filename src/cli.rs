@@ -235,7 +235,7 @@ async fn run_inner(args: Args) -> Result<i32> {
                 (&progress, &mut produced_outputs),
             ) => result,
             _ = tokio::time::sleep(Duration::from_secs(14400)) => {
-                progress.println(format!("  处理超时（3600 秒），跳过: {stem}"));
+                progress.println(format!("  处理超时（14400 秒），跳过: {stem}"));
                 log("ERROR", &format!("处理超时: {}", book.display()));
                 failed += 1;
                 progress.inc(1);
