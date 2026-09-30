@@ -1,0 +1,36 @@
+name: one-shot-tag-release
+
+on:
+  push:
+    branches: ["fix/windows-same-file"]
+    paths:
+      - ".github/workflows/tag-release.yml"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag-and-dispatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create v0.1.1 tag on main
+        shell: bash
+        run: |
+          git fetch origin main --tags
+          target="$(git rev-parse origin/main)"
+          version="$(git show "$target:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -n1)"
+          test "$version" = "0.1.1"
+          if git rev-parse -q --verify refs/tags/v0.1.1 >/dev/null; then
+            test "$(git rev-list -n1 v0.1.1)" = "$target"
+          else
+            git tag v0.1.1 "$target"
+            git push origin refs/tags/v0.1.1
+          fi
+      - name: Dispatch release workflow for tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref v0.1.1
