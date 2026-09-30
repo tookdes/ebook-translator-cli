@@ -1984,6 +1984,40 @@ mod tests {
     }
 
     #[test]
+    fn repeated_visible_text_keeps_every_extracted_element() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("duplicates.epub");
+        make_epub(
+            &input,
+            Some(
+                "<html><body><h1>Book</h1><p>Repeated</p><p>Repeated</p><blockquote>Repeated</blockquote></body></html>",
+            ),
+        );
+        let config = Config {
+            metadata_translation: true,
+            ..Default::default()
+        };
+        let (elements, _) = extract_from_epub(&input, &config).unwrap();
+        let repeated = elements
+            .iter()
+            .filter(|element| element.original == "Repeated")
+            .collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 3);
+        assert_eq!(
+            repeated
+                .iter()
+                .map(|element| element.signature.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+
+        let cache = crate::cache::TranslationCache::open(Path::new("unused"), false).unwrap();
+        cache.save_paragraphs(&cache_rows(&elements)).unwrap();
+        assert_eq!(cache.all_with_ignored().unwrap().len(), elements.len());
+    }
+
+    #[test]
     fn xml_entities_and_event_based_rewrites_stay_aligned() {
         let opf = br#"<?xml version='1.0'?><package><metadata>
             <!--<dc:title xmlns:dc='x'>Draft</dc:title>-->
