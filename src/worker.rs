@@ -247,12 +247,17 @@ impl TranslationWorker {
             "{}\n\nThe user input is a JSON array of translation units. Return ONLY a valid JSON array with exactly the same ids, each exactly once, in any order, using objects of the form {{\"id\":\"...\",\"text\":\"translated text\"}}. Do not merge, split, omit, invent, or rename ids. Preserve immutable HTML/glossary tokens exactly.",
             self.prompt_for(&self.engine.engine)
         );
-        let response = self.translate_one_with(&self.engine, &original, &prompt).await?;
-        match self.parse_merged_response(group, &response, &self.engine.engine.name) {
+        let merged = self
+            .translate_one_with(&self.engine, &original, &prompt)
+            .await
+            .and_then(|response| {
+                self.parse_merged_response(group, &response, &self.engine.engine.name)
+            });
+        match merged {
             Ok(translations) => Ok(translations),
             Err(error) => {
                 self.message(format!(
-                    "  合并翻译结构无效（{error:#}），回退逐段"
+                    "  合并翻译失败（{error:#}），回退逐段"
                 ));
                 let mut fallback = HashMap::new();
                 for paragraph in group {
