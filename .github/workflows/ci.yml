@@ -30,6 +30,18 @@ jobs:
           "$RUNNER_TEMP/ebook-translator-install/bin/ebook-translator" --version
           test "$("$RUNNER_TEMP/ebook-translator-install/bin/ebook-translator" --version)" = "ebook-translator 0.1.1"
 
+  platform-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --locked
+
   audit:
     runs-on: ubuntu-24.04
     steps:

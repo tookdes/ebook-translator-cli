@@ -940,23 +940,13 @@ fn validate_output_target(input: &Path, output: &Path, produced: &[PathBuf]) -> 
     Ok(())
 }
 
-#[cfg_attr(windows, allow(unused_variables))]
 fn same_file(left: &Path, right: &Path) -> Result<bool> {
-    let (Ok(left_meta), Ok(right_meta)) = (fs::metadata(left), fs::metadata(right)) else {
-        return Ok(canonical_target(left)? == canonical_target(right)?);
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Ok(left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino())
-    }
-    #[cfg(windows)]
-    {
-        Ok(canonical_target(left)? == canonical_target(right)?)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Ok(canonical_target(left)? == canonical_target(right)?)
+    match same_file::is_same_file(left, right) {
+        Ok(same) => Ok(same),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(canonical_target(left)? == canonical_target(right)?)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
