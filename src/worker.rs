@@ -10,7 +10,6 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rand::RngExt;
-use regex::Regex;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
@@ -32,6 +31,29 @@ enum ErrorKind {
 struct RateLimiter {
     interval: Duration,
     next: Mutex<Instant>,
+}
+
+struct EngineRuntime {
+    engine: Arc<Engine>,
+    limiter: Arc<RateLimiter>,
+    semaphore: Arc<Semaphore>,
+}
+
+impl EngineRuntime {
+    fn new(engine: Engine) -> Self {
+        let config = engine.config.clone();
+        Self {
+            engine: Arc::new(engine),
+            limiter: Arc::new(RateLimiter::new(config.request_interval)),
+            semaphore: Arc::new(Semaphore::new(config.concurrency.clamp(1, MAX_CONCURRENCY))),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TranslationOutcome {
+    text: String,
+    engine_name: String,
 }
 
 impl RateLimiter {
@@ -66,13 +88,11 @@ impl RateLimiter {
 }
 
 pub struct TranslationWorker {
-    engine: Arc<Engine>,
-    fallback: Vec<Arc<Engine>>,
+    engine: EngineRuntime,
+    fallback: Vec<EngineRuntime>,
     cache: Arc<TranslationCache>,
     config: Arc<Config>,
     glossary: Arc<Glossary>,
-    limiter: Arc<RateLimiter>,
-    semaphore: Arc<Semaphore>,
     stopped: Arc<AtomicBool>,
     abort_count: Arc<AtomicUsize>,
 }
@@ -84,19 +104,12 @@ impl TranslationWorker {
         config: Config,
         glossary: Glossary,
     ) -> Self {
-        let interval = config.engine_config(None).request_interval;
-        let concurrency = config
-            .engine_config(None)
-            .concurrency
-            .clamp(1, MAX_CONCURRENCY);
         Self {
-            engine: Arc::new(engine),
+            engine: EngineRuntime::new(engine),
             fallback: Vec::new(),
             cache,
             config: Arc::new(config),
             glossary: Arc::new(glossary),
-            limiter: Arc::new(RateLimiter::new(interval)),
-            semaphore: Arc::new(Semaphore::new(concurrency)),
             stopped: Arc::new(AtomicBool::new(false)),
             abort_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -105,7 +118,7 @@ impl TranslationWorker {
 
 
     pub fn with_fallback(mut self, engine: Engine) -> Self {
-        self.fallback.push(Arc::new(engine));
+        self.fallback.push(EngineRuntime::new(engine));
         self
     }
 
@@ -117,9 +130,14 @@ impl TranslationWorker {
     }
 
     fn record_failure(&self) {
-        // ponytail: never stop the whole batch on repeated failures; each
-        // paragraph independently exhausts primary + fallback chain.
-        let _ = self.abort_count.fetch_add(1, Ordering::Relaxed);
+        let failures = self.abort_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= self.config.max_error_count.max(1) {
+            self.stopped.store(true, Ordering::Relaxed);
+            self.message(format!(
+                "  连续失败达到 max_error_count={}，停止启动新的翻译任务",
+                self.config.max_error_count
+            ));
+        }
     }
 
     pub async fn translate_batch(&self, paragraphs: Vec<Paragraph>) -> (usize, usize) {
@@ -128,7 +146,7 @@ impl TranslationWorker {
             self.config.merge_enabled,
             self.config.merge_length,
         );
-        let total_groups = groups.len();
+        let total_paragraphs = paragraphs.len();
         let mut tasks = FuturesUnordered::new();
         for group in groups {
             tasks.push(async move {
@@ -148,7 +166,7 @@ impl TranslationWorker {
                 let now = Instant::now();
                 if now.duration_since(last_heartbeat) >= Duration::from_secs(30) {
                     self.message(format!(
-                        "  进度: {done}/{total_groups} 段, 失败 {failed}"
+                        "  进度: {done}/{total_paragraphs} 段, 失败 {failed}"
                     ));
                     last_heartbeat = now;
                 }
@@ -160,13 +178,12 @@ impl TranslationWorker {
                         .map(|paragraph| {
                             translations
                                 .get(&paragraph.id)
-                                .filter(|value| !value.trim().is_empty())
-                                .cloned()
-                                .map(|translation| {
+                                .filter(|value| !value.text.trim().is_empty())
+                                .map(|outcome| {
                                     (
                                         paragraph.id.clone(),
-                                        translation,
-                                        self.config.engine.clone(),
+                                        outcome.text.clone(),
+                                        outcome.engine_name.clone(),
                                         self.config.target_lang.clone(),
                                     )
                                 })
@@ -203,7 +220,10 @@ impl TranslationWorker {
         (done, failed)
     }
 
-    async fn translate_group(&self, group: &[Paragraph]) -> Result<HashMap<String, String>> {
+    async fn translate_group(
+        &self,
+        group: &[Paragraph],
+    ) -> Result<HashMap<String, TranslationOutcome>> {
         if group.len() == 1 {
             let paragraph = &group[0];
             return Ok([(
@@ -212,45 +232,94 @@ impl TranslationWorker {
             )]
             .into());
         }
-        // ponytail: use simple double-newline separator instead of JSON merge —
-        // free models handle plain text far more reliably than structured JSON
-        let original = group
+
+        let protected = group
             .iter()
-            .map(|paragraph| self.glossary.apply(&paragraph.original))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let response = self
-            .translate_one(&original, self.config.effective_prompt())
-            .await?;
-        let parts = Regex::new(r"\r?\n\s*\r?\n")?
-            .split(response.trim())
-            .map(str::trim)
+            .map(|paragraph| {
+                serde_json::json!({
+                    "id": paragraph.id,
+                    "text": self.glossary.apply(&paragraph.original),
+                })
+            })
             .collect::<Vec<_>>();
-        if parts.len() == group.len() {
-            let mut translations = HashMap::new();
-            for (paragraph, translation) in group.iter().zip(parts) {
-                let restored = self.glossary.restore(&paragraph.original, translation)?;
-                let translation = accept_markup_translation(&paragraph.original, &restored)?;
-                translations.insert(paragraph.id.clone(), translation);
+        let original = serde_json::to_string(&protected)?;
+        let prompt = format!(
+            "{}\n\nThe user input is a JSON array of translation units. Return ONLY a valid JSON array with exactly the same ids, each exactly once, in any order, using objects of the form {{\"id\":\"...\",\"text\":\"translated text\"}}. Do not merge, split, omit, invent, or rename ids. Preserve immutable HTML/glossary tokens exactly.",
+            self.prompt_for(&self.engine.engine)
+        );
+        let response = self.translate_one_with(&self.engine, &original, &prompt).await?;
+        match self.parse_merged_response(group, &response, &self.engine.engine.name) {
+            Ok(translations) => Ok(translations),
+            Err(error) => {
+                self.message(format!(
+                    "  合并翻译结构无效（{error:#}），回退逐段"
+                ));
+                let mut fallback = HashMap::new();
+                for paragraph in group {
+                    fallback.insert(
+                        paragraph.id.clone(),
+                        self.translate_paragraph(paragraph).await?,
+                    );
+                }
+                Ok(fallback)
             }
-            return Ok(translations);
         }
-        self.message(format!(
-            "  合并翻译段落数不匹配（预期 {}, 实际 {}），回退逐段",
-            group.len(),
-            parts.len()
-        ));
-        let mut fallback = HashMap::new();
-        for paragraph in group {
-            fallback.insert(
-                paragraph.id.clone(),
-                self.translate_paragraph(paragraph).await?,
-            );
-        }
-        Ok(fallback)
     }
 
-    async fn translate_paragraph(&self, paragraph: &Paragraph) -> Result<String> {
+    fn parse_merged_response(
+        &self,
+        group: &[Paragraph],
+        response: &str,
+        engine_name: &str,
+    ) -> Result<HashMap<String, TranslationOutcome>> {
+        let value: serde_json::Value = serde_json::from_str(response.trim())?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| anyhow!("合并译文不是 JSON 数组"))?;
+        if items.len() != group.len() {
+            bail!("合并译文数量不匹配：预期 {}，实际 {}", group.len(), items.len());
+        }
+        let expected = group
+            .iter()
+            .map(|paragraph| paragraph.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut raw = HashMap::new();
+        for item in items {
+            let id = item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("合并译文缺少字符串 id"))?;
+            let text = item
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("合并译文 {id} 缺少字符串 text"))?;
+            if !expected.contains(id) {
+                bail!("合并译文包含未知 id: {id}");
+            }
+            if raw.insert(id.to_owned(), text.to_owned()).is_some() {
+                bail!("合并译文包含重复 id: {id}");
+            }
+        }
+        let mut translations = HashMap::new();
+        for paragraph in group {
+            let translated = raw
+                .remove(&paragraph.id)
+                .ok_or_else(|| anyhow!("合并译文缺少 id: {}", paragraph.id))?;
+            let protected = self.glossary.apply(&paragraph.original);
+            let restored = self.glossary.restore(&protected, translated.trim())?;
+            let text = accept_markup_translation(&paragraph.original, &restored)?;
+            translations.insert(
+                paragraph.id.clone(),
+                TranslationOutcome {
+                    text,
+                    engine_name: engine_name.to_owned(),
+                },
+            );
+        }
+        Ok(translations)
+    }
+
+    async fn translate_paragraph(&self, paragraph: &Paragraph) -> Result<TranslationOutcome> {
         let original = self.glossary.apply(&paragraph.original);
         if self.fallback.is_empty() {
             // No fallback: keep a hard deadline so one paragraph cannot stall the batch.
@@ -270,7 +339,7 @@ impl TranslationWorker {
         &self,
         paragraph: &Paragraph,
         original: &str,
-    ) -> Result<String> {
+    ) -> Result<TranslationOutcome> {
         let mut last_error = match self
             .translate_paragraph_with(&self.engine, paragraph, original)
             .await
@@ -289,7 +358,12 @@ impl TranslationWorker {
                 .translate_paragraph_with(fallback, paragraph, original)
                 .await
             {
-                Ok(translation) => return Ok(translation),
+                Ok(translation) => {
+                    return Ok(TranslationOutcome {
+                        text: translation,
+                        engine_name: runtime.engine.name.clone(),
+                    })
+                },
                 Err(error) => last_error = error,
             }
             // The LAST fallback must never give up: retry forever until it
@@ -318,15 +392,15 @@ impl TranslationWorker {
 
     async fn translate_paragraph_with(
         &self,
-        engine: &Engine,
+        runtime: &EngineRuntime,
         paragraph: &Paragraph,
         original: &str,
-    ) -> Result<String> {
+    ) -> Result<TranslationOutcome> {
         let has_markup = paragraph.original.contains("{{etm_");
         let has_glossary = original.contains("{{etg_");
-        let prompt = protected_prompt(self.config.effective_prompt(), has_markup, has_glossary);
+        let prompt = protected_prompt(self.prompt_for(&runtime.engine), has_markup, has_glossary);
         for attempt in 0..=usize::from(has_markup || has_glossary) {
-            let result = self.translate_one_with(engine, original, &prompt).await?;
+            let result = self.translate_one_with(runtime, original, &prompt).await?;
             let restored = match self.glossary.restore(original, result.trim()) {
                 Ok(restored) => restored,
                 Err(error) if attempt == 0 => {
@@ -346,32 +420,32 @@ impl TranslationWorker {
         unreachable!()
     }
 
-    async fn translate_one(&self, text: &str, prompt: &str) -> Result<String> {
-        self.translate_one_with(&self.engine, text, prompt).await
+    fn prompt_for<'a>(&'a self, engine: &'a Engine) -> &'a str {
+        engine.config.prompt.as_deref().unwrap_or(&self.config.prompt)
     }
 
     async fn translate_one_with(
         &self,
-        engine: &Engine,
+        runtime: &EngineRuntime,
         text: &str,
         prompt: &str,
     ) -> Result<String> {
-        let config = self.config.engine_config(None);
+        let config = &runtime.engine.config;
         for attempt in 1..=config.max_retries.max(1) {
-            self.limiter.acquire(&self.stopped).await?;
-            let permit = self.semaphore.acquire().await?;
+            runtime.limiter.acquire(&self.stopped).await?;
+            let permit = runtime.semaphore.acquire().await?;
             if self.stopped.load(Ordering::Relaxed) {
                 drop(permit);
                 bail!("翻译批次已停止");
             }
-            // Hard cap each HTTP attempt so a hung gateway cannot stall a paragraph forever.
-            let attempt_timeout = Duration::from_secs_f64(
-                config.request_timeout.clamp(10.0, 60.0),
-            );
-            let translated = tokio::time::timeout(attempt_timeout, engine.translate(text, prompt))
-                .await
-                .map_err(|_| anyhow!("请求超时（{attempt_timeout:?}）"))
-                .and_then(|result| result);
+            let attempt_timeout = Duration::from_secs_f64(config.request_timeout);
+            let translated = tokio::time::timeout(
+                attempt_timeout,
+                runtime.engine.translate(text, prompt),
+            )
+            .await
+            .map_err(|_| anyhow!("请求超时（{attempt_timeout:?}）"))
+            .and_then(|result| result);
             drop(permit);
             match translated {
                 Ok(result) if !result.trim().is_empty() => return Ok(result),
@@ -400,7 +474,6 @@ impl TranslationWorker {
                         .chain()
                         .find_map(|x| x.downcast_ref::<ApiError>())
                         .and_then(|x| x.retry_after);
-                    let server_wait = retry_after;
                     let base = match kind {
                         ErrorKind::RateLimit => {
                             Duration::from_secs_f64(config.retry_delay * 2.0 * attempt as f64)
@@ -410,13 +483,11 @@ impl TranslationWorker {
                         }
                         _ => Duration::from_secs_f64(config.retry_delay * attempt as f64),
                     };
-                    let wait = if let Some(wait) = server_wait {
-                        wait
-                    } else {
+                    let wait = retry_after.unwrap_or_else(|| {
                         base.mul_f64(rand::rng().random_range(0.5..1.5))
-                    };
+                    });
                     if kind == ErrorKind::RateLimit {
-                        self.limiter.defer(wait).await;
+                        runtime.limiter.defer(wait).await;
                     }
                     self.sleep_or_stop(wait).await?;
                 }
@@ -464,23 +535,15 @@ fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Ve
     }
     let mut groups = Vec::new();
     let mut current = Vec::new();
-    let mut length = 0;
+    let mut length = 0usize;
     for paragraph in paragraphs {
         let size = paragraph.original.chars().count();
-        if paragraph.original.contains("{{etm_") {
-            if !current.is_empty() {
-                groups.push(std::mem::take(&mut current));
-                length = 0;
-            }
-            groups.push(vec![paragraph.clone()]);
-            continue;
-        }
-        if !current.is_empty() && length + size > limit {
+        if !current.is_empty() && length.saturating_add(size) > limit {
             groups.push(std::mem::take(&mut current));
             length = 0;
         }
         current.push(paragraph.clone());
-        length += size;
+        length = length.saturating_add(size);
     }
     if !current.is_empty() {
         groups.push(current);
@@ -588,7 +651,7 @@ mod tests {
             .iter()
             .map(Vec::len)
             .collect::<Vec<_>>(),
-            [1, 2]
+            [2, 1]
         );
         let original = "{{etm_o_00000}}a{{etm_n_00001}}{{etm_c_00000}}";
         assert!(validate_markup_tokens(original, original).is_ok());
@@ -692,7 +755,8 @@ mod tests {
         };
         let result = worker.translate_paragraph(&paragraph).await.unwrap();
         server.join().unwrap();
-        assert_eq!(result, "{{etm_o_00000}}译文{{etm_c_00000}}");
+        assert_eq!(result.text, "{{etm_o_00000}}译文{{etm_c_00000}}");
+        assert_eq!(result.engine_name, "openai");
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(requests.lock().unwrap()[0].contains("immutable HTML tokens"));
     }
@@ -793,11 +857,12 @@ mod tests {
             .await
             .unwrap();
         server.join().unwrap();
-        assert_eq!(result["a"], "甲");
-        assert_eq!(result["b"], "乙");
+        assert_eq!(result["a"].text, "甲");
+        assert_eq!(result["b"].text, "乙");
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests[0].contains("one\\n\\ntwo"));
+        assert!(requests[0].contains("\\"id\\":\\"a\\""));
+        assert!(requests[0].contains("\\"id\\":\\"b\\""));
         assert!(requests[0].contains("detected language"));
     }
 }
