@@ -836,20 +836,28 @@ mod tests {
     }
 
     #[test]
-    fn thinking_strategies_toggle_all_variants() {
-        let mut body = json!({"model": "free", "messages": []});
-        apply_thinking_strategy(&mut body, "thinking_disabled");
+    fn extra_body_fields_are_passed_through_without_vendor_logic() {
+        let mut config = cfg("https://example.com/v1");
+        config.extra.insert(
+            "chat_template_kwargs".into(),
+            json!({"enable_thinking": false}),
+        );
+        config
+            .extra
+            .insert("thinking".into(), json!({"type": "disabled"}));
+        config
+            .extra
+            .insert("reasoning_effort".into(), json!("none"));
+        config.extra.insert("enable_thinking".into(), json!(false));
+        let engine = Engine::new("openai", config, "en", "zh").unwrap();
+        let body = engine.body("x", "translate", false).unwrap();
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
         assert_eq!(body["thinking"], json!({"type": "disabled"}));
-        assert!(body.get("reasoning_effort").is_none());
-        apply_thinking_strategy(&mut body, "reasoning_none");
         assert_eq!(body["reasoning_effort"], json!("none"));
-        assert!(body.get("thinking").is_none());
-        apply_thinking_strategy(&mut body, "enable_thinking_false");
         assert_eq!(body["enable_thinking"], json!(false));
-        apply_thinking_strategy(&mut body, "none");
-        assert!(body.get("thinking").is_none());
-        assert!(body.get("reasoning_effort").is_none());
-        assert!(body.get("enable_thinking").is_none());
     }
 
     #[test]
