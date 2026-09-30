@@ -13,7 +13,7 @@ use html5ever::{
 };
 use percent_encoding::percent_decode_str;
 use quick_xml::{
-    Reader, Writer,
+    Reader, Writer, XmlVersion,
     escape::{resolve_xml_entity, unescape},
     events::{BytesText, Event},
 };
@@ -566,7 +566,7 @@ fn read_container(archive: &mut ZipArchive<File>) -> Result<String> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"full-path" {
-                        let path = attr.decode_and_unescape_value(reader.decoder())?;
+                        let path = attr.normalized_value(XmlVersion::Implicit1_0)?;
                         return Ok(percent_decode_str(&path)
                             .decode_utf8_lossy()
                             .replace('\\', "/"));
@@ -598,7 +598,7 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     let value = attr
-                        .decode_and_unescape_value(reader.decoder())?
+                        .normalized_value(XmlVersion::Implicit1_0)?
                         .into_owned();
                     match attr.key.local_name().as_ref() {
                         b"id" => item.id = value,
@@ -620,7 +620,7 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"idref" {
                         spine_ids.push(
-                            attr.decode_and_unescape_value(reader.decoder())?
+                            attr.normalized_value(XmlVersion::Implicit1_0)?
                                 .into_owned(),
                         );
                     }
@@ -631,7 +631,7 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"toc" {
                         package.spine_toc = attr
-                            .decode_and_unescape_value(reader.decoder())?
+                            .normalized_value(XmlVersion::Implicit1_0)?
                             .into_owned();
                     }
                 }
