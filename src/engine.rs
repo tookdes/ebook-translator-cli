@@ -169,23 +169,6 @@ impl Engine {
         if !result.is_empty() {
             return Ok(result);
         }
-        // content 为空时，很多模型把译文写进 reasoning_content，或把思考参数理解
-        // 不一致。健壮兜底：依次用不同的"关思考"参数重试，最后才从 reasoning 提取。
-        for strategy in thinking_disable_strategies() {
-            let mut retry_body = body.clone();
-            apply_thinking_strategy(&mut retry_body, strategy);
-            let response = self.request(&retry_body).send().await?;
-            let response = check_status(response).await?;
-            let result = if self.config.stream {
-                self.parse_stream(response).await?
-            } else {
-                self.parse_response(read_json_limited(response).await?).await?
-            };
-            let result = result.trim().to_owned();
-            if !result.is_empty() {
-                return Ok(result);
-            }
-        }
         bail!("API 返回空译文")
     }
 
@@ -414,43 +397,6 @@ impl Engine {
         }
         Ok(output)
     }
-}
-
-fn apply_thinking_strategy(body: &mut Value, strategy: &str) {
-    let Value::Object(map) = body else {
-        return;
-    };
-    match strategy {
-        "thinking_disabled" => {
-            map.insert("thinking".into(), json!({"type": "disabled"}));
-            map.remove("reasoning_effort");
-            map.remove("enable_thinking");
-        }
-        "reasoning_none" => {
-            map.insert("reasoning_effort".into(), json!("none"));
-            map.remove("thinking");
-            map.remove("enable_thinking");
-        }
-        "enable_thinking_false" => {
-            map.insert("enable_thinking".into(), json!(false));
-            map.remove("thinking");
-            map.remove("reasoning_effort");
-        }
-        _ => {
-            map.remove("thinking");
-            map.remove("reasoning_effort");
-            map.remove("enable_thinking");
-        }
-    }
-}
-
-fn thinking_disable_strategies() -> Vec<&'static str> {
-    vec![
-        "thinking_disabled",
-        "reasoning_none",
-        "enable_thinking_false",
-        "none",
-    ]
 }
 
 fn parse_sse_line(
