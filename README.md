@@ -120,6 +120,21 @@ ebook-translator 输入 [输出] [选项]
 
 `openai.base_url` 可以填网关根地址（如 `https://example.com/v1`），也可以直接填完整端点（如 `https://example.com/v1/chat/completions`）；程序会避免重复拼接路径。自定义兼容端点可以把 `model` 留空，程序不会强行填默认模型。
 
+每个引擎支持 `extra`，并兼容别名 `extra_body`，用于把任意 JSON 顶层字段原样并入请求体。程序不解释这些字段，也不会针对厂商或模型自动补写 thinking/reasoning 参数。例如需要关闭某个兼容端点的思考模式时，可以自行配置：
+
+```json
+{
+  "extra_body": {
+    "chat_template_kwargs": {"enable_thinking": false},
+    "thinking": {"type": "disabled"},
+    "reasoning_effort": "none",
+    "enable_thinking": false
+  }
+}
+```
+
+具体字段由所使用的模型、供应商或网关定义；本项目只负责透传。
+
 ## 支持格式
 
 | 输入 | 后端 | 说明 |
