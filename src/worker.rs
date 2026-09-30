@@ -624,7 +624,7 @@ mod tests {
             .iter()
             .map(Vec::len)
             .collect::<Vec<_>>(),
-            [2, 1]
+            [3]
         );
         let original = "{{etm_o_00000}}a{{etm_n_00001}}{{etm_c_00000}}";
         assert!(validate_markup_tokens(original, original).is_ok());
