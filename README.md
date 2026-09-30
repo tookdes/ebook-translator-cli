@@ -11,7 +11,7 @@ cargo build --release
 ./target/release/ebook-translator --version
 ```
 
-开发自测：`cargo test && cargo clippy --all-targets -- -D warnings`。
+开发自测：`cargo fmt --check && cargo test --locked && cargo clippy --all-targets --all-features -- -D warnings`。CI 还会执行依赖安全检查、版本/tag 一致性检查和安装后 `--version` smoke test。
 
 ## 什么时候需要 calibre？
 
@@ -137,13 +137,13 @@ ebook-translator 输入 [输出] [选项]
 
 进度缓存在 `~/.cache/ebook-translator/books/`。中断后重跑同一命令自动续翻。
 
-缓存 key 会绑定源文件内容、提取后的段落、引擎、模型、地址、采样参数、额外请求参数、源/目标语言、prompt 和术语表。修改这些内容后会自动使用新的缓存，避免误用旧译文；切换合并批次或译文样式会继续复用已有的逐段译文。
+缓存 key 会绑定源文件内容、提取后的段落、引擎、模型、地址、采样参数、额外请求参数、源/目标语言、prompt 和术语表。修改这些内容后会自动使用新的缓存，避免误用旧译文；切换合并批次或译文样式会继续复用已有的逐段译文。缓存表以稳定段落 `id` 为主键，signature/md5 仅建普通索引，因此书中重复标题、脚注或重复可见段落不会因为相同 signature 被丢弃。
 
 使用 `--no-cache` 会改用内存缓存：本次运行仍能完成写回，但不会落盘，也不会在下次运行复用译文。
 
 如果某本书仍有段落翻译失败，程序会保留缓存进度但不生成半翻译输出文件；修好配置或换 key 后重跑即可继续。
 
-`merge_enabled` 默认关闭。启用后会按 `merge_length` 发送带段落 ID 的 JSON；返回 ID 不完整或输出受限时自动回退逐段翻译。
+`merge_enabled` 默认开启，`merge_length` 默认 `300000`，单位是 Unicode 字符而不是 token。合并请求会发送带稳定段落 ID 的 JSON 数组，并严格校验返回 ID：缺失、重复、额外 ID、非法 JSON、占位符损坏或合并请求失败都会整组回退逐段翻译。带内联 HTML 的段落也可以参与合并，HTML/术语占位符必须原样保留。
 
 ## 退出码与日志
 
