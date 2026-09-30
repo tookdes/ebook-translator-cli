@@ -326,18 +326,7 @@ impl TranslationWorker {
 
     async fn translate_paragraph(&self, paragraph: &Paragraph) -> Result<TranslationOutcome> {
         let original = self.glossary.apply(&paragraph.original);
-        if self.fallback.is_empty() {
-            // No fallback: keep a hard deadline so one paragraph cannot stall the batch.
-            tokio::time::timeout(
-                Duration::from_secs(180),
-                self.translate_paragraph_inner(paragraph, &original),
-            )
-            .await
-            .map_err(|_| anyhow!("段落翻译超时（180 秒）"))?
-        } else {
-            // With a fallback chain, the last fallback retries forever by design.
-            self.translate_paragraph_inner(paragraph, &original).await
-        }
+        self.translate_paragraph_inner(paragraph, &original).await
     }
 
     async fn translate_paragraph_inner(
@@ -352,7 +341,6 @@ impl TranslationWorker {
             Ok(translation) => return Ok(translation),
             Err(error) => error,
         };
-        let total = self.fallback.len();
         for (index, fallback) in self.fallback.iter().enumerate() {
             self.message(format!(
                 "  渠道 {} 失败，使用兜底渠道 #{}: {last_error:#}",
@@ -363,33 +351,8 @@ impl TranslationWorker {
                 .translate_paragraph_with(fallback, paragraph, original)
                 .await
             {
-                Ok(translation) => {
-                    return Ok(TranslationOutcome {
-                        text: translation,
-                        engine_name: runtime.engine.name.clone(),
-                    })
-                },
+                Ok(translation) => return Ok(translation),
                 Err(error) => last_error = error,
-            }
-            // The LAST fallback must never give up: retry forever until it
-            // produces a valid translation. It is slow but reliable by design.
-            if index + 1 == total {
-                self.message(format!(
-                    "  最后兜底渠道失败，无限重试: {last_error:#}"
-                ));
-                loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    match self
-                        .translate_paragraph_with(fallback, paragraph, original)
-                        .await
-                    {
-                        Ok(translation) => return Ok(translation),
-                        Err(error) => {
-                            last_error = error;
-                            self.message(format!("  最后兜底渠道重试失败: {last_error:#}"));
-                        }
-                    }
-                }
             }
         }
         Err(last_error)
@@ -415,7 +378,12 @@ impl TranslationWorker {
                 Err(error) => return Err(error),
             };
             match accept_markup_translation(&paragraph.original, &restored) {
-                Ok(translation) => return Ok(translation),
+                Ok(translation) => {
+                    return Ok(TranslationOutcome {
+                        text: translation,
+                        engine_name: runtime.engine.name.clone(),
+                    })
+                }
                 Err(error) if attempt == 0 && has_markup => {
                     self.message(format!("  模型损坏 HTML 占位符，自动重试一次: {error}"));
                 }
