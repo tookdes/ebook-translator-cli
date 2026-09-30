@@ -56,7 +56,17 @@
             "request_timeout": 60.0,
             "max_retries": 5,
             "retry_delay": 5.0,
-            "stream": false
+            "stream": false,
+            "extra_body": {
+                "chat_template_kwargs": {
+                    "enable_thinking": false
+                },
+                "thinking": {
+                    "type": "disabled"
+                },
+                "reasoning_effort": "none",
+                "enable_thinking": false
+            }
         },
         "deepseek": {
             "api_key": "你的密钥",
