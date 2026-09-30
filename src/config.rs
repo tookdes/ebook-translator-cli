@@ -198,8 +198,8 @@ impl Default for Config {
             prompt: DEFAULT_PROMPT.into(),
             cache_enabled: true,
             cache_dir: default_cache_dir(),
-            merge_enabled: false,
-            merge_length: 1800,
+            merge_enabled: true,
+            merge_length: 300_000,
             translation_position: "below".into(),
             translation_style: String::new(),
             column_gap: ColumnGap::default(),
@@ -374,6 +374,9 @@ impl Config {
         if !self.input_encoding.is_empty() && canonical_encoding(&self.input_encoding).is_none() {
             bail!("不支持的 input_encoding: {}", self.input_encoding);
         }
+        if self.max_error_count == 0 {
+            bail!("max_error_count 必须大于 0");
+        }
         for (name, cfg) in &self.engines {
             if !matches!(name.as_str(), "openai" | "deepseek" | "claude" | "deeplx" | "deepx") {
                 bail!("未知引擎 '{name}'，可用: claude, deepseek, openai, deeplx, deepx");
@@ -470,7 +473,8 @@ mod tests {
         assert_eq!(cfg.engine_config(None).api_key, "x");
         assert_eq!(cfg.engine_config(None).temperature, None);
         assert_eq!(Config::default().engine_config(None).temperature, Some(0.3));
-        assert!(!Config::default().merge_enabled);
+        assert!(Config::default().merge_enabled);
+        assert_eq!(Config::default().merge_length, 300_000);
 
         let mut typo: Config =
             serde_json::from_str(r#"{"engines":{"openai":{"temprature":0.2}}}"#).unwrap();
