@@ -1607,8 +1607,10 @@ fn decode_page(data: &[u8]) -> Result<String> {
             bail!("UTF-16LE XHTML 字节数无效");
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         return String::from_utf16(&units).context("UTF-16LE XHTML 无效");
     }
@@ -1617,8 +1619,10 @@ fn decode_page(data: &[u8]) -> Result<String> {
             bail!("UTF-16BE XHTML 字节数无效");
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect::<Vec<_>>();
         return String::from_utf16(&units).context("UTF-16BE XHTML 无效");
     }
