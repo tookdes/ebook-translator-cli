@@ -834,8 +834,8 @@ mod tests {
         assert_eq!(result["b"].text, "乙");
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests[0].contains("\\"id\\":\\"a\\""));
-        assert!(requests[0].contains("\\"id\\":\\"b\\""));
+        assert!(requests[0].contains(r#"\"id\":\"a\""#));
+        assert!(requests[0].contains(r#"\"id\":\"b\""#));
         assert!(requests[0].contains("detected language"));
     }
 }
