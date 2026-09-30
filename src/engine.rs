@@ -6,10 +6,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
-use reqwest::{Client, Response, Url, redirect};
+use reqwest::{Client, RequestBuilder, Response, Url, redirect};
 use serde_json::{Map, Value, json};
 
 use crate::config::EngineConfig;
+
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineKind {
@@ -35,6 +38,7 @@ impl fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 pub struct Engine {
+    pub name: String,
     pub kind: EngineKind,
     pub config: EngineConfig,
     pub endpoint: Url,
@@ -127,6 +131,7 @@ impl Engine {
             }))
             .build()?;
         Ok(Self {
+            name: name.into(),
             kind,
             config,
             endpoint,
@@ -153,52 +158,33 @@ impl Engine {
             .replace("<tlang>", &self.target_lang)
             .replace("<slang>", source_lang);
         let body = self.body(text, &prompt, self.config.stream)?;
-        let mut request = self
-            .client
-            .post(self.endpoint.clone())
-            .json(&body)
-            .header("content-type", "application/json");
-        request = match self.kind {
-            EngineKind::Claude => request
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", "2023-06-01"),
-            _ => request.bearer_auth(&self.config.api_key),
-        };
-        let response = request.send().await?;
+        let response = self.request(&body).send().await?;
         let response = check_status(response).await?;
         let result = if self.config.stream {
             self.parse_stream(response).await?
         } else {
-            self.parse_response(response.json().await?).await?
+            self.parse_response(read_json_limited(response).await?)
+                .await?
         };
         let result = result.trim().to_owned();
         if !result.is_empty() {
             return Ok(result);
         }
-        // content 为空时，很多模型把译文写进 reasoning_content，或把思考参数理解
-        // 不一致。健壮兜底：依次用不同的"关思考"参数重试，最后才从 reasoning 提取。
-        for strategy in thinking_disable_strategies() {
-            let mut retry_body = body.clone();
-            apply_thinking_strategy(&mut retry_body, strategy);
-            let response = self
-                .client
-                .post(self.endpoint.clone())
-                .json(&retry_body)
-                .header("content-type", "application/json")
-                .send()
-                .await?;
-            let response = check_status(response).await?;
-            let result = if self.config.stream {
-                self.parse_stream(response).await?
-            } else {
-                self.parse_response(response.json().await?).await?
-            };
-            let result = result.trim().to_owned();
-            if !result.is_empty() {
-                return Ok(result);
-            }
-        }
         bail!("API 返回空译文")
+    }
+
+    fn request(&self, body: &Value) -> RequestBuilder {
+        let request = self
+            .client
+            .post(self.endpoint.clone())
+            .json(body)
+            .header("content-type", "application/json");
+        match self.kind {
+            EngineKind::Claude => request
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", "2023-06-01"),
+            _ => request.bearer_auth(&self.config.api_key),
+        }
     }
 
     async fn translate_deeplx(&self, text: &str) -> Result<String> {
@@ -227,20 +213,17 @@ impl Engine {
         }
         let response = request.send().await?;
         let response = check_status(response).await?;
-        let data: Value = response.json().await?;
+        let data = read_json_limited(response).await?;
         let text = data
             .get("data")
             .and_then(|data| match data {
                 Value::String(value) => Some(value.as_str()),
-                _ => data
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        data.get("translations")
-                            .and_then(Value::as_array)
-                            .and_then(|items| items.first())
-                            .and_then(|item| item.get("text").and_then(Value::as_str))
-                    }),
+                _ => data.get("text").and_then(Value::as_str).or_else(|| {
+                    data.get("translations")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("text").and_then(Value::as_str))
+                }),
             })
             .or_else(|| data.get("text").and_then(Value::as_str))
             .ok_or_else(|| anyhow!("DeepLX 返回格式无法识别: {}", truncate_json(&data)))?;
@@ -343,9 +326,6 @@ impl Engine {
                     .flatten()
                     .filter_map(|block| block.get("text").and_then(Value::as_str))
                     .collect::<String>();
-                if text.is_empty() {
-                    bail!("API 返回空结果: {}", truncate_json(&data));
-                }
                 Ok(text)
             }
             _ => {
@@ -371,10 +351,13 @@ impl Engine {
                             .and_then(Value::as_str)
                             .map(extract_tail_translation)
                     })
-                    .or_else(|| choice.get("text").and_then(Value::as_str).map(str::to_owned));
-                content
-                    .filter(|x| !x.trim().is_empty())
-                    .ok_or_else(|| anyhow!("API 返回空译文: {}", truncate_json(&data)))
+                    .or_else(|| {
+                        choice
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                Ok(content.unwrap_or_default())
             }
         }
     }
@@ -385,9 +368,18 @@ impl Engine {
         let mut pending = String::new();
         let mut output = String::new();
         let mut completed = false;
+        let mut received = 0usize;
         while let Some(chunk) = bytes.next().await {
+            let chunk = chunk?;
+            received = received.saturating_add(chunk.len());
+            if received > MAX_RESPONSE_BYTES {
+                bail!(
+                    "API 响应过大（超过 {} MiB）",
+                    MAX_RESPONSE_BYTES / 1024 / 1024
+                );
+            }
             // 网络分块边界可能落在多字节 UTF-8 序列中间,残缺尾部留在 buf 等下一块。
-            buf.extend_from_slice(&chunk?);
+            buf.extend_from_slice(&chunk);
             drain_valid_utf8(&mut buf, &mut pending)?;
             while let Some(pos) = pending.find('\n') {
                 let line = pending[..pos].trim_end_matches('\r').trim().to_owned();
@@ -411,43 +403,6 @@ impl Engine {
         }
         Ok(output)
     }
-}
-
-fn apply_thinking_strategy(body: &mut Value, strategy: &str) {
-    let Value::Object(map) = body else {
-        return;
-    };
-    match strategy {
-        "thinking_disabled" => {
-            map.insert("thinking".into(), json!({"type": "disabled"}));
-            map.remove("reasoning_effort");
-            map.remove("enable_thinking");
-        }
-        "reasoning_none" => {
-            map.insert("reasoning_effort".into(), json!("none"));
-            map.remove("thinking");
-            map.remove("enable_thinking");
-        }
-        "enable_thinking_false" => {
-            map.insert("enable_thinking".into(), json!(false));
-            map.remove("thinking");
-            map.remove("reasoning_effort");
-        }
-        _ => {
-            map.remove("thinking");
-            map.remove("reasoning_effort");
-            map.remove("enable_thinking");
-        }
-    }
-}
-
-fn thinking_disable_strategies() -> Vec<&'static str> {
-    vec![
-        "thinking_disabled",
-        "reasoning_none",
-        "enable_thinking_false",
-        "none",
-    ]
 }
 
 fn parse_sse_line(
@@ -498,6 +453,30 @@ fn drain_valid_utf8(buf: &mut Vec<u8>, pending: &mut String) -> Result<()> {
     Ok(())
 }
 
+async fn read_bytes_limited(response: Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("API 响应过大（上限 {} 字节）", limit);
+    }
+    let mut stream = response.bytes_stream();
+    let mut output = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if output.len().saturating_add(chunk.len()) > limit {
+            bail!("API 响应过大（上限 {} 字节）", limit);
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
+}
+
+async fn read_json_limited(response: Response) -> Result<Value> {
+    let bytes = read_bytes_limited(response, MAX_RESPONSE_BYTES).await?;
+    serde_json::from_slice(&bytes).context("API 响应 JSON 无效")
+}
+
 async fn check_status(response: Response) -> Result<Response> {
     if response.status().is_success() {
         return Ok(response);
@@ -508,7 +487,10 @@ async fn check_status(response: Response) -> Result<Response> {
         .get("retry-after")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_retry_after);
-    let body = response.text().await.unwrap_or_default();
+    let body = read_bytes_limited(response, MAX_ERROR_RESPONSE_BYTES)
+        .await
+        .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body);
     Err(ApiError {
         status: Some(status),
         retry_after,
@@ -621,10 +603,48 @@ pub fn deepl_lang(language: &str) -> String {
     };
     if matches!(
         code.as_str(),
-        "zh" | "en" | "ja" | "ko" | "fr" | "de" | "es" | "pt" | "it" | "ru" | "ar" | "nl"
-            | "pl" | "tr" | "vi" | "id" | "th" | "hi" | "uk" | "el" | "sv" | "nb" | "fi"
-            | "cs" | "ro" | "hu" | "bg" | "da" | "sk" | "sl" | "lt" | "lv" | "et" | "hr"
-            | "sr" | "he" | "fa" | "ur" | "bn" | "ta" | "ms" | "ca" | "cy"
+        "zh" | "en"
+            | "ja"
+            | "ko"
+            | "fr"
+            | "de"
+            | "es"
+            | "pt"
+            | "it"
+            | "ru"
+            | "ar"
+            | "nl"
+            | "pl"
+            | "tr"
+            | "vi"
+            | "id"
+            | "th"
+            | "hi"
+            | "uk"
+            | "el"
+            | "sv"
+            | "nb"
+            | "fi"
+            | "cs"
+            | "ro"
+            | "hu"
+            | "bg"
+            | "da"
+            | "sk"
+            | "sl"
+            | "lt"
+            | "lv"
+            | "et"
+            | "hr"
+            | "sr"
+            | "he"
+            | "fa"
+            | "ur"
+            | "bn"
+            | "ta"
+            | "ms"
+            | "ca"
+            | "cy"
     ) {
         code.to_ascii_uppercase()
     } else if code.eq_ignore_ascii_case("auto")
@@ -733,6 +753,44 @@ fn truncate_json(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn common_request_builder_keeps_auth_headers() {
+        let openai = Engine::new(
+            "openai",
+            EngineConfig {
+                api_key: "openai-secret".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                ..Default::default()
+            },
+            "English",
+            "Chinese",
+        )
+        .unwrap();
+        let request = openai.request(&json!({})).build().unwrap();
+        assert_eq!(
+            request.headers().get("authorization").unwrap(),
+            "Bearer openai-secret"
+        );
+
+        let claude = Engine::new(
+            "claude",
+            EngineConfig {
+                api_key: "claude-secret".into(),
+                base_url: "http://127.0.0.1:9".into(),
+                ..Default::default()
+            },
+            "English",
+            "Chinese",
+        )
+        .unwrap();
+        let request = claude.request(&json!({})).build().unwrap();
+        assert_eq!(request.headers().get("x-api-key").unwrap(), "claude-secret");
+        assert_eq!(
+            request.headers().get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
+    }
+
     fn cfg(base_url: &str) -> EngineConfig {
         EngineConfig {
             api_key: "x".into(),
@@ -778,20 +836,28 @@ mod tests {
     }
 
     #[test]
-    fn thinking_strategies_toggle_all_variants() {
-        let mut body = json!({"model": "free", "messages": []});
-        apply_thinking_strategy(&mut body, "thinking_disabled");
+    fn extra_body_fields_are_passed_through_without_vendor_logic() {
+        let mut config = cfg("https://example.com/v1");
+        config.extra.insert(
+            "chat_template_kwargs".into(),
+            json!({"enable_thinking": false}),
+        );
+        config
+            .extra
+            .insert("thinking".into(), json!({"type": "disabled"}));
+        config
+            .extra
+            .insert("reasoning_effort".into(), json!("none"));
+        config.extra.insert("enable_thinking".into(), json!(false));
+        let engine = Engine::new("openai", config, "en", "zh").unwrap();
+        let body = engine.body("x", "translate", false).unwrap();
+        assert_eq!(
+            body["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
         assert_eq!(body["thinking"], json!({"type": "disabled"}));
-        assert!(body.get("reasoning_effort").is_none());
-        apply_thinking_strategy(&mut body, "reasoning_none");
         assert_eq!(body["reasoning_effort"], json!("none"));
-        assert!(body.get("thinking").is_none());
-        apply_thinking_strategy(&mut body, "enable_thinking_false");
         assert_eq!(body["enable_thinking"], json!(false));
-        apply_thinking_strategy(&mut body, "none");
-        assert!(body.get("thinking").is_none());
-        assert!(body.get("reasoning_effort").is_none());
-        assert!(body.get("enable_thinking").is_none());
     }
 
     #[test]

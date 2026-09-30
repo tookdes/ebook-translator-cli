@@ -1,9 +1,7 @@
 use std::{path::Path, sync::Mutex};
 
 use anyhow::{Result, anyhow};
-#[cfg(test)]
-use rusqlite::OptionalExtension;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paragraph {
@@ -35,12 +33,14 @@ impl TranslationCache {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS cache (
-               id TEXT UNIQUE, md5 TEXT UNIQUE, raw TEXT, original TEXT,
+               id TEXT PRIMARY KEY, md5 TEXT NOT NULL, raw TEXT, original TEXT,
                ignored INTEGER DEFAULT 0, attributes TEXT, page TEXT,
                translation TEXT, engine_name TEXT, target_lang TEXT
              );
+             CREATE INDEX IF NOT EXISTS cache_md5_idx ON cache(md5);
              CREATE TABLE IF NOT EXISTS info (key TEXT UNIQUE, value TEXT);",
         )?;
+        migrate_legacy_cache_schema(&conn)?;
         Ok(Self(Mutex::new(conn)))
     }
 
@@ -69,9 +69,16 @@ impl TranslationCache {
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO cache
+                "INSERT INTO cache
                  (id, md5, raw, original, ignored, attributes, page, translation, engine_name, target_lang)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL)
+                 ON CONFLICT(id) DO UPDATE SET
+                   md5=excluded.md5,
+                   raw=excluded.raw,
+                   original=excluded.original,
+                   ignored=excluded.ignored,
+                   attributes=excluded.attributes,
+                   page=excluded.page"
             )?;
             for row in rows {
                 stmt.execute(params![
@@ -221,6 +228,40 @@ impl TranslationCache {
     }
 }
 
+fn migrate_legacy_cache_schema(conn: &Connection) -> Result<()> {
+    let sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='cache'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    let normalized = sql.to_ascii_lowercase().replace(['\n', '\r', '\t'], " ");
+    if !normalized.contains("md5 text unique") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE cache RENAME TO cache_legacy;
+         CREATE TABLE cache (
+           id TEXT PRIMARY KEY, md5 TEXT NOT NULL, raw TEXT, original TEXT,
+           ignored INTEGER DEFAULT 0, attributes TEXT, page TEXT,
+           translation TEXT, engine_name TEXT, target_lang TEXT
+         );
+         INSERT INTO cache
+           (id, md5, raw, original, ignored, attributes, page, translation, engine_name, target_lang)
+         SELECT id, md5, raw, original, ignored, attributes, page, translation, engine_name, target_lang
+         FROM cache_legacy;
+         DROP TABLE cache_legacy;
+         CREATE INDEX IF NOT EXISTS cache_md5_idx ON cache(md5);
+         COMMIT;"
+    )?;
+    Ok(())
+}
+
 pub fn md5(text: &str) -> String {
     format!("{:x}", md5::compute(text.as_bytes()))
 }
@@ -242,6 +283,44 @@ mod tests {
             engine_name: None,
             target_lang: None,
         }
+    }
+
+    #[test]
+    fn duplicate_signatures_are_preserved() {
+        let cache = TranslationCache::open(Path::new("unused"), false).unwrap();
+        let mut first = row("a", false);
+        let mut second = row("b", false);
+        first.md5 = "same-signature".into();
+        second.md5 = "same-signature".into();
+        cache.save_paragraphs(&[first, second]).unwrap();
+        let rows = cache.all_with_ignored().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].md5, rows[1].md5);
+    }
+
+    #[test]
+    fn migrates_legacy_unique_md5_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cache (
+                   id TEXT UNIQUE, md5 TEXT UNIQUE, raw TEXT, original TEXT,
+                   ignored INTEGER DEFAULT 0, attributes TEXT, page TEXT,
+                   translation TEXT, engine_name TEXT, target_lang TEXT
+                 );
+                 CREATE TABLE info (key TEXT UNIQUE, value TEXT);",
+            )
+            .unwrap();
+        }
+        let cache = TranslationCache::open(&path, true).unwrap();
+        let mut first = row("a", false);
+        let mut second = row("b", false);
+        first.md5 = "same".into();
+        second.md5 = "same".into();
+        cache.save_paragraphs(&[first, second]).unwrap();
+        assert_eq!(cache.all_with_ignored().unwrap().len(), 2);
     }
 
     #[test]

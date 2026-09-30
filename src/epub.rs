@@ -13,7 +13,7 @@ use html5ever::{
 };
 use percent_encoding::percent_decode_str;
 use quick_xml::{
-    Reader, Writer,
+    Reader, Writer, XmlVersion,
     escape::{resolve_xml_entity, unescape},
     events::{BytesText, Event},
 };
@@ -566,7 +566,7 @@ fn read_container(archive: &mut ZipArchive<File>) -> Result<String> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"full-path" {
-                        let path = attr.decode_and_unescape_value(reader.decoder())?;
+                        let path = attr.normalized_value(XmlVersion::Implicit1_0)?;
                         return Ok(percent_decode_str(&path)
                             .decode_utf8_lossy()
                             .replace('\\', "/"));
@@ -597,9 +597,7 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 };
                 for attr in event.attributes() {
                     let attr = attr?;
-                    let value = attr
-                        .decode_and_unescape_value(reader.decoder())?
-                        .into_owned();
+                    let value = attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
                     match attr.key.local_name().as_ref() {
                         b"id" => item.id = value,
                         b"href" => item.href = value,
@@ -619,10 +617,8 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"idref" {
-                        spine_ids.push(
-                            attr.decode_and_unescape_value(reader.decoder())?
-                                .into_owned(),
-                        );
+                        spine_ids
+                            .push(attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned());
                     }
                 }
             }
@@ -630,9 +626,8 @@ fn parse_package(data: &[u8]) -> Result<Package> {
                 for attr in event.attributes() {
                     let attr = attr?;
                     if attr.key.local_name().as_ref() == b"toc" {
-                        package.spine_toc = attr
-                            .decode_and_unescape_value(reader.decoder())?
-                            .into_owned();
+                        package.spine_toc =
+                            attr.normalized_value(XmlVersion::Implicit1_0)?.into_owned();
                     }
                 }
             }
@@ -1612,8 +1607,10 @@ fn decode_page(data: &[u8]) -> Result<String> {
             bail!("UTF-16LE XHTML 字节数无效");
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         return String::from_utf16(&units).context("UTF-16LE XHTML 无效");
     }
@@ -1622,8 +1619,10 @@ fn decode_page(data: &[u8]) -> Result<String> {
             bail!("UTF-16BE XHTML 字节数无效");
         }
         let units = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect::<Vec<_>>();
         return String::from_utf16(&units).context("UTF-16BE XHTML 无效");
     }
@@ -1981,6 +1980,40 @@ mod tests {
             .unwrap();
         assert!(body.original.contains("{{etm_o_"));
         assert!(body.original.contains("{{etm_n_"));
+    }
+
+    #[test]
+    fn repeated_visible_text_keeps_every_extracted_element() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("duplicates.epub");
+        make_epub(
+            &input,
+            Some(
+                "<html><body><h1>Book</h1><p>Repeated</p><p>Repeated</p><blockquote>Repeated</blockquote></body></html>",
+            ),
+        );
+        let config = Config {
+            metadata_translation: true,
+            ..Default::default()
+        };
+        let (elements, _) = extract_from_epub(&input, &config).unwrap();
+        let repeated = elements
+            .iter()
+            .filter(|element| element.original == "Repeated")
+            .collect::<Vec<_>>();
+        assert_eq!(repeated.len(), 3);
+        assert_eq!(
+            repeated
+                .iter()
+                .map(|element| element.signature.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+
+        let cache = crate::cache::TranslationCache::open(Path::new("unused"), false).unwrap();
+        cache.save_paragraphs(&cache_rows(&elements)).unwrap();
+        assert_eq!(cache.all_with_ignored().unwrap().len(), elements.len());
     }
 
     #[test]
