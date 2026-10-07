@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -171,35 +171,13 @@ impl TranslationWorker {
             }
             match result {
                 Ok(translations) => {
-                    let updates = group
-                        .iter()
-                        .map(|paragraph| {
-                            translations
-                                .get(&paragraph.id)
-                                .filter(|value| !value.text.trim().is_empty())
-                                .map(|outcome| {
-                                    (
-                                        paragraph.id.clone(),
-                                        outcome.text.clone(),
-                                        outcome.engine_name.clone(),
-                                        self.config.target_lang.clone(),
-                                    )
-                                })
-                        })
-                        .collect::<Option<Vec<_>>>();
-                    let saved = updates
-                        .ok_or_else(|| anyhow!("合并翻译缺少段落或返回空译文"))
-                        .and_then(|updates| self.cache.update_translations(&updates));
-                    match saved {
-                        Ok(()) => {
-                            done += group.len();
-                            self.abort_count.store(0, Ordering::Relaxed);
-                        }
-                        Err(error) => {
-                            failed += group.len();
-                            self.message(format!("  缓存写入失败: {error:#}"));
-                            self.record_failure();
-                        }
+                    if translations.len() == group.len() {
+                        done += group.len();
+                        self.abort_count.store(0, Ordering::Relaxed);
+                    } else {
+                        failed += group.len();
+                        self.message("  合并翻译内部结果数量不完整");
+                        self.record_failure();
                     }
                 }
                 Err(error) => {
@@ -219,6 +197,48 @@ impl TranslationWorker {
     }
 
     async fn translate_group(
+        &self,
+        group: &[Paragraph],
+    ) -> Result<HashMap<String, TranslationOutcome>> {
+        let mut pending = VecDeque::from([group.to_vec()]);
+        let mut completed = HashMap::new();
+
+        while let Some(chunk) = pending.pop_front() {
+            if self.stopped.load(Ordering::Relaxed) {
+                bail!("翻译批次已停止");
+            }
+
+            match self.translate_group_once(&chunk).await {
+                Ok(translations) => {
+                    self.persist_translations(&chunk, &translations)?;
+                    completed.extend(translations);
+                }
+                Err(error)
+                    if chunk.len() > 1
+                        && !matches!(
+                            classify_error(&error),
+                            ErrorKind::Permanent | ErrorKind::RateLimit
+                        ) =>
+                {
+                    let middle = chunk.len() / 2;
+                    let left = chunk[..middle].to_vec();
+                    let right = chunk[middle..].to_vec();
+                    self.message(format!(
+                        "  合并翻译失败（{error:#}），拆分为 {}+{} 段后重试",
+                        left.len(),
+                        right.len()
+                    ));
+                    pending.push_front(right);
+                    pending.push_front(left);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(completed)
+    }
+
+    async fn translate_group_once(
         &self,
         group: &[Paragraph],
     ) -> Result<HashMap<String, TranslationOutcome>> {
@@ -245,26 +265,35 @@ impl TranslationWorker {
             "{}\n\nThe user input is a JSON array of translation units. Return ONLY a valid JSON array with exactly the same ids, each exactly once, in any order, using objects of the form {{\"id\":\"...\",\"text\":\"translated text\"}}. Do not merge, split, omit, invent, or rename ids. Preserve immutable HTML/glossary tokens exactly.",
             self.prompt_for(&self.engine.engine)
         );
-        let merged = self
+        let response = self
             .translate_one_with(&self.engine, &original, &prompt)
-            .await
-            .and_then(|response| {
-                self.parse_merged_response(group, &response, &self.engine.engine.name)
-            });
-        match merged {
-            Ok(translations) => Ok(translations),
-            Err(error) => {
-                self.message(format!("  合并翻译失败（{error:#}），回退逐段"));
-                let mut fallback = HashMap::new();
-                for paragraph in group {
-                    fallback.insert(
-                        paragraph.id.clone(),
-                        self.translate_paragraph(paragraph).await?,
-                    );
-                }
-                Ok(fallback)
-            }
-        }
+            .await?;
+        self.parse_merged_response(group, &response, &self.engine.engine.name)
+    }
+
+    fn persist_translations(
+        &self,
+        group: &[Paragraph],
+        translations: &HashMap<String, TranslationOutcome>,
+    ) -> Result<()> {
+        let updates = group
+            .iter()
+            .map(|paragraph| {
+                translations
+                    .get(&paragraph.id)
+                    .filter(|value| !value.text.trim().is_empty())
+                    .map(|outcome| {
+                        (
+                            paragraph.id.clone(),
+                            outcome.text.clone(),
+                            outcome.engine_name.clone(),
+                            self.config.target_lang.clone(),
+                        )
+                    })
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| anyhow!("合并翻译缺少段落或返回空译文"))?;
+        self.cache.update_translations(&updates)
     }
 
     fn parse_merged_response(
@@ -410,17 +439,24 @@ impl TranslationWorker {
         let config = &runtime.engine.config;
         for attempt in 1..=config.max_retries.max(1) {
             runtime.limiter.acquire(&self.stopped).await?;
-            let permit = runtime.semaphore.acquire().await?;
+            let permit = tokio::select! {
+                permit = runtime.semaphore.acquire() => permit?,
+                _ = self.wait_until_stopped() => bail!("翻译批次已停止"),
+            };
             if self.stopped.load(Ordering::Relaxed) {
                 drop(permit);
                 bail!("翻译批次已停止");
             }
             let attempt_timeout = Duration::from_secs_f64(config.request_timeout);
-            let translated =
-                tokio::time::timeout(attempt_timeout, runtime.engine.translate(text, prompt))
-                    .await
-                    .map_err(|_| anyhow!("请求超时（{attempt_timeout:?}）"))
-                    .and_then(|result| result);
+            let translated = tokio::select! {
+                result = runtime.engine.translate(text, prompt) => result,
+                _ = tokio::time::sleep(attempt_timeout) => {
+                    Err(anyhow!("请求超时（{attempt_timeout:?}）"))
+                }
+                _ = self.wait_until_stopped() => {
+                    Err(anyhow!("翻译批次已停止"))
+                }
+            };
             drop(permit);
             match translated {
                 Ok(result) if !result.trim().is_empty() => return Ok(result),
@@ -470,6 +506,12 @@ impl TranslationWorker {
         bail!("翻译失败")
     }
 
+    async fn wait_until_stopped(&self) {
+        while !self.stopped.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn sleep_or_stop(&self, wait: Duration) -> Result<()> {
         let deadline = Instant::now() + wait;
         loop {
@@ -511,7 +553,12 @@ fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Ve
     let mut length = 0usize;
     for paragraph in paragraphs {
         let size = paragraph.original.chars().count();
-        if !current.is_empty() && length.saturating_add(size) > limit {
+        let page_changed = current
+            .last()
+            .is_some_and(|previous: &Paragraph| previous.page != paragraph.page);
+        if !current.is_empty()
+            && (page_changed || length.saturating_add(size) > limit)
+        {
             groups.push(std::mem::take(&mut current));
             length = 0;
         }
