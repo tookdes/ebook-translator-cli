@@ -199,7 +199,7 @@ impl Default for Config {
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             merge_enabled: true,
-            merge_length: 300_000,
+            merge_length: 100_000,
             translation_position: "below".into(),
             translation_style: String::new(),
             column_gap: ColumnGap::default(),
