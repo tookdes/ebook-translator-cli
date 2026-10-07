@@ -673,6 +673,19 @@ mod tests {
             .collect::<Vec<_>>(),
             [3]
         );
+        let mut page_a = paragraph("pa", "one");
+        page_a.page = Some("a.xhtml".into());
+        let mut page_b = paragraph("pb", "two");
+        page_b.page = Some("a.xhtml".into());
+        let mut page_c = paragraph("pc", "three");
+        page_c.page = Some("b.xhtml".into());
+        assert_eq!(
+            merge_groups(&[page_a, page_b, page_c], true, 100)
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
         let original = "{{etm_o_00000}}a{{etm_n_00001}}{{etm_c_00000}}";
         assert!(validate_markup_tokens(original, original).is_ok());
         assert!(validate_markup_tokens(original, "a").is_err());
@@ -782,24 +795,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn merge_count_mismatch_falls_back_to_individual_requests() {
+    async fn merge_failure_bisects_before_individual_fallback() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         let server_captured = captured.clone();
         let server = thread::spawn(move || {
-            for response in [r#"[{"id":"0","text":"只返回一段"}]"#, "甲", "乙"] {
+            for response in [
+                r#"[{"id":"0","text":"只返回一段"}]"#,
+                r#"[{"id":"a","text":"甲"},{"id":"b","text":"乙"}]"#,
+                r#"[{"id":"c","text":"丙"},{"id":"d","text":"丁"}]"#,
+            ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
                 loop {
                     let read = stream.read(&mut buffer).unwrap();
                     request.extend_from_slice(&buffer[..read]);
-                    let header_end = request
+                    let Some(header_end) = request
                         .windows(4)
                         .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4);
-                    let Some(header_end) = header_end else {
+                        .map(|index| index + 4)
+                    else {
                         continue;
                     };
                     let headers = String::from_utf8_lossy(&request[..header_end]);
@@ -873,16 +890,198 @@ mod tests {
             Glossary::default(),
         );
         let result = worker
-            .translate_group(&[paragraph("a", "one"), paragraph("b", "two")])
+            .translate_group(&[
+                paragraph("a", "one"),
+                paragraph("b", "two"),
+                paragraph("c", "three"),
+                paragraph("d", "four"),
+            ])
             .await
             .unwrap();
         server.join().unwrap();
+
         assert_eq!(result["a"].text, "甲");
         assert_eq!(result["b"].text, "乙");
+        assert_eq!(result["c"].text, "丙");
+        assert_eq!(result["d"].text, "丁");
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(requests[0].contains(r#"\"id\":\"a\""#));
-        assert!(requests[0].contains(r#"\"id\":\"b\""#));
-        assert!(requests[0].contains("detected language"));
+        assert!(requests[0].contains(r#"\"id\":\"d\""#));
+        assert!(requests[1].contains(r#"\"id\":\"a\""#));
+        assert!(!requests[1].contains(r#"\"id\":\"c\""#));
+        assert!(requests[2].contains(r#"\"id\":\"c\""#));
+        assert!(!requests[2].contains(r#"\"id\":\"a\""#));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn successful_subgroups_are_checkpointed_before_later_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (status, response) in [
+                ("200 OK", r#"[{"id":"0","text":"只返回一段"}]"#),
+                (
+                    "200 OK",
+                    r#"[{"id":"a","text":"甲"},{"id":"b","text":"乙"}]"#,
+                ),
+                ("401 Unauthorized", "unauthorized"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + length {
+                        break;
+                    }
+                }
+                let body = if status.starts_with("200") {
+                    serde_json::json!({
+                        "choices": [{"message": {"content": response}, "finish_reason": "stop"}]
+                    })
+                    .to_string()
+                } else {
+                    response.to_owned()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let paragraph = |id: &str, original: &str| Paragraph {
+            id: id.into(),
+            md5: id.into(),
+            raw: String::new(),
+            original: original.into(),
+            ignored: false,
+            attributes: None,
+            page: Some("chapter.xhtml".into()),
+            translation: None,
+            engine_name: None,
+            target_lang: None,
+        };
+        let paragraphs = vec![
+            paragraph("a", "one"),
+            paragraph("b", "two"),
+            paragraph("c", "three"),
+            paragraph("d", "four"),
+        ];
+        let cache = Arc::new(
+            TranslationCache::open(std::path::Path::new("unused"), false).unwrap(),
+        );
+        cache.save_paragraphs(&paragraphs).unwrap();
+
+        let mut config = Config {
+            merge_enabled: true,
+            ..Default::default()
+        };
+        config.engines.insert(
+            "openai".into(),
+            crate::config::EngineConfig {
+                api_key: "test".into(),
+                base_url: format!("http://{address}/v1"),
+                model: "mock".into(),
+                request_interval: 0.0,
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            "openai",
+            config.engine_config(None),
+            &config.source_lang,
+            &config.target_lang,
+        )
+        .unwrap();
+        let worker = TranslationWorker::new(
+            engine,
+            cache.clone(),
+            config,
+            Glossary::default(),
+        );
+
+        assert!(worker.translate_group(&paragraphs).await.is_err());
+        server.join().unwrap();
+
+        let rows = cache
+            .all()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.id, row.translation))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(rows["a"].as_deref(), Some("甲"));
+        assert_eq!(rows["b"].as_deref(), Some("乙"));
+        assert!(rows["c"].is_none());
+        assert!(rows["d"].is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn semaphore_wait_is_cancelled_when_worker_stops() {
+        let mut config = Config::default();
+        config.engines.insert(
+            "openai".into(),
+            crate::config::EngineConfig {
+                api_key: "test".into(),
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "mock".into(),
+                concurrency: 1,
+                request_interval: 0.0,
+                ..Default::default()
+            },
+        );
+        let engine = Engine::new(
+            "openai",
+            config.engine_config(None),
+            &config.source_lang,
+            &config.target_lang,
+        )
+        .unwrap();
+        let worker = TranslationWorker::new(
+            engine,
+            Arc::new(TranslationCache::open(std::path::Path::new("unused"), false).unwrap()),
+            config,
+            Glossary::default(),
+        );
+        let held = worker.engine.semaphore.acquire().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let (result, _) = tokio::join!(
+                worker.translate_one_with(&worker.engine, "text", "translate"),
+                async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    worker.stopped.store(true, Ordering::Relaxed);
+                }
+            );
+            result
+        })
+        .await
+        .expect("semaphore wait should be cancellable");
+        drop(held);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("翻译批次已停止"));
+    }
+
 }
