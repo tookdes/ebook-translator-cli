@@ -24,6 +24,7 @@ use crate::{
 enum ErrorKind {
     Permanent,
     RateLimit,
+    Truncated,
     Empty,
     Transient,
 }
@@ -473,7 +474,7 @@ impl TranslationWorker {
                 Err(error) => {
                     let kind = classify_error(&error);
                     let allowed = match kind {
-                        ErrorKind::Permanent => 1,
+                        ErrorKind::Permanent | ErrorKind::Truncated => 1,
                         ErrorKind::Empty => config.max_retries.min(2),
                         _ => config.max_retries,
                     }
@@ -580,6 +581,16 @@ fn classify_error(error: &anyhow::Error) -> ErrorKind {
     }
     let text = error.to_string().to_lowercase();
     if [
+        "输出被截断",
+        "stop_reason=max_tokens",
+        "finish_reason=length",
+    ]
+    .iter()
+    .any(|x| text.contains(x))
+    {
+        return ErrorKind::Truncated;
+    }
+    if [
         "401",
         "403",
         "unauthorized",
@@ -590,10 +601,8 @@ fn classify_error(error: &anyhow::Error) -> ErrorKind {
         "api 密钥无效",
         "密钥无效",
         "已过期",
-        "输出被截断",
         "内容过滤",
         "content_filter",
-        "stop_reason=max_tokens",
         "stop_reason=refusal",
         "不能覆盖保留字段",
     ]
@@ -695,6 +704,10 @@ mod tests {
         assert!(prompt.contains("Copy every token exactly once"));
         assert_eq!(protected_prompt("translate", false, false), "translate");
         assert!(protected_prompt("translate", false, true).contains("glossary tokens"));
+        assert_eq!(
+            classify_error(&anyhow!("API 输出被截断 (finish_reason=length)")),
+            ErrorKind::Truncated
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
