@@ -1036,6 +1036,16 @@ fn inject_body(
     Ok((serialize_xhtml(&document, data)?, injected))
 }
 
+fn parent_requires_inline_translation(node: &NodeRef<'_>) -> bool {
+    node.ancestors(Some(1))
+        .first()
+        .and_then(NodeRef::node_name)
+        .is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            !NON_INLINE_TAGS.contains(&name.as_str()) && !matches!(name.as_str(), "html" | "body")
+        })
+}
+
 fn inject_translation(node: &NodeRef<'_>, restored: &str, config: &Config) -> Result<()> {
     let position = config.translation_position.as_str();
     let name = node.node_name().unwrap_or_default().to_ascii_lowercase();
@@ -1053,7 +1063,7 @@ fn inject_translation(node: &NodeRef<'_>, restored: &str, config: &Config) -> Re
         node.set_html(inner);
         return Ok(());
     }
-    if GROUP_TAGS.contains(&name.as_str()) {
+    if GROUP_TAGS.contains(&name.as_str()) || parent_requires_inline_translation(node) {
         let span = translation_span(restored, config);
         match position {
             "above" => node.prepend_html(format!("{span}<br>")),
@@ -1100,7 +1110,7 @@ fn element_html(
         keep_id,
         Some("et-translation"),
         Some(&style),
-        Some((lang.as_deref(), direction.as_str())),
+        Some((lang.as_deref(), direction.as_deref())),
     );
     format!("{start}{inner}</{}>", node.node_name().unwrap_or_default())
 }
@@ -1108,12 +1118,12 @@ fn element_html(
 fn translation_span(inner: &str, config: &Config) -> String {
     let lang = target_lang_code(config);
     let direction = target_direction(config, lang.as_deref());
-    let mut attrs = format!(
-        " class=\"et-translation\" dir=\"{}\"",
-        escape_attr(&direction)
-    );
+    let mut attrs = " class=\"et-translation\"".to_owned();
     if let Some(lang) = lang {
         attrs.push_str(&format!(" lang=\"{}\"", escape_attr(&lang)));
+    }
+    if let Some(direction) = direction {
+        attrs.push_str(&format!(" dir=\"{}\"", escape_attr(&direction)));
     }
     let mut style = String::new();
     if !config.translation_color.is_empty() {
@@ -1241,7 +1251,7 @@ fn start_tag(
     keep_id: bool,
     extra_class: Option<&str>,
     extra_style: Option<&str>,
-    language: Option<(Option<&str>, &str)>,
+    language: Option<(Option<&str>, Option<&str>)>,
 ) -> String {
     let name = node.node_name().unwrap_or_default();
     let mut output = format!("<{name}");
@@ -1291,7 +1301,9 @@ fn start_tag(
         if let Some(lang) = lang {
             output.push_str(&format!(" lang=\"{}\"", escape_attr(lang)));
         }
-        output.push_str(&format!(" dir=\"{}\"", escape_attr(direction)));
+        if let Some(direction) = direction {
+            output.push_str(&format!(" dir=\"{}\"", escape_attr(direction)));
+        }
     }
     output.push('>');
     output
@@ -1896,11 +1908,11 @@ pub fn target_lang_code(config: &Config) -> Option<String> {
     .map(|(_, code)| code.into())
 }
 
-pub fn target_direction(config: &Config, lang: Option<&str>) -> String {
+pub fn target_direction(config: &Config, lang: Option<&str>) -> Option<String> {
     if config.target_direction != "auto" {
-        return config.target_direction.clone();
+        return Some(config.target_direction.clone());
     }
-    if lang.is_some_and(|lang| {
+    lang.is_some_and(|lang| {
         matches!(
             lang.split('-')
                 .next()
@@ -1909,11 +1921,8 @@ pub fn target_direction(config: &Config, lang: Option<&str>) -> String {
                 .as_str(),
             "ar" | "fa" | "he" | "ur" | "ps" | "sd" | "ug" | "yi"
         )
-    }) {
-        "rtl".into()
-    } else {
-        "auto".into()
-    }
+    })
+    .then(|| "rtl".into())
 }
 
 #[cfg(test)]
@@ -2193,7 +2202,10 @@ mod tests {
             target_lang_code: "ar-EG".into(),
             ..Default::default()
         };
-        assert_eq!(target_direction(&config, Some("ar-EG")), "rtl");
+        assert_eq!(
+            target_direction(&config, Some("ar-EG")).as_deref(),
+            Some("rtl")
+        );
         assert_eq!(
             resolve_href("OEBPS/content.opf", "Text/chapter%201.xhtml?q=1#x"),
             "OEBPS/Text/chapter 1.xhtml"
@@ -2249,6 +2261,42 @@ mod tests {
         )
         .unwrap();
         assert!(!elements.iter().any(|element| element.kind == "body"));
+    }
+
+    #[test]
+    fn translation_inside_inline_pagebreak_parent_does_not_add_block_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("pagebreak.epub");
+        let output = dir.path().join("pagebreak-out.epub");
+        make_epub(
+            &input,
+            Some(
+                r#"<html xmlns:epub="http://www.idpf.org/2007/ops"><body><span aria-label=" Page 527. " epub:type="pagebreak"><h1>ACKNOWLEDGMENTS</h1><p id="p">Thanks to everyone.</p></span></body></html>"#,
+            ),
+        );
+        let config = Config::default();
+        let (elements, _) = extract_from_epub(&input, &config).unwrap();
+        let paragraph = elements
+            .iter()
+            .find(|element| element.original.contains("Thanks to everyone"))
+            .unwrap();
+        write_translated_epub(
+            &input,
+            &output,
+            &[(paragraph.uid.clone(), "感谢所有人。".into())]
+                .into_iter()
+                .collect(),
+            &config,
+            1,
+            "Book",
+        )
+        .unwrap();
+
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let html = String::from_utf8(read_member(&mut archive, "OEBPS/c.xhtml").unwrap()).unwrap();
+        assert_eq!(html.matches("<p").count(), 1);
+        assert!(html.contains("<span class=\"et-translation\""));
+        assert!(!html.contains("<p class=\"et-translation\""));
     }
 
     #[test]
@@ -2327,6 +2375,7 @@ mod tests {
         let html = String::from_utf8(read_member(&mut archive, "OEBPS/c.xhtml").unwrap()).unwrap();
         assert_eq!(html.matches("<p").count(), 1);
         assert!(html.contains("<span class=\"et-translation\""));
+        assert!(!html.contains("dir=\"auto\""));
 
         let list_input = dir.path().join("list.epub");
         let list_output = dir.path().join("list-out.epub");

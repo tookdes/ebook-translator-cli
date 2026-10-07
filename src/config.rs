@@ -199,7 +199,7 @@ impl Default for Config {
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             merge_enabled: true,
-            merge_length: 300_000,
+            merge_length: 100_000,
             translation_position: "below".into(),
             translation_style: String::new(),
             column_gap: ColumnGap::default(),
@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(cfg.engine_config(None).temperature, None);
         assert_eq!(Config::default().engine_config(None).temperature, Some(0.3));
         assert!(Config::default().merge_enabled);
-        assert_eq!(Config::default().merge_length, 300_000);
+        assert_eq!(Config::default().merge_length, 100_000);
 
         let passthrough: Config = serde_json::from_str(
             r#"{"engines":{"openai":{"extra_body":{"thinking":{"type":"disabled"},"enable_thinking":false}}}}"#,
