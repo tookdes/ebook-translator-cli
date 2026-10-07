@@ -556,9 +556,7 @@ fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Ve
         let page_changed = current
             .last()
             .is_some_and(|previous: &Paragraph| previous.page != paragraph.page);
-        if !current.is_empty()
-            && (page_changed || length.saturating_add(size) > limit)
-        {
+        if !current.is_empty() && (page_changed || length.saturating_add(size) > limit) {
             groups.push(std::mem::take(&mut current));
             length = 0;
         }
@@ -989,9 +987,8 @@ mod tests {
             paragraph("c", "three"),
             paragraph("d", "four"),
         ];
-        let cache = Arc::new(
-            TranslationCache::open(std::path::Path::new("unused"), false).unwrap(),
-        );
+        let cache =
+            Arc::new(TranslationCache::open(std::path::Path::new("unused"), false).unwrap());
         cache.save_paragraphs(&paragraphs).unwrap();
 
         let mut config = Config {
@@ -1015,12 +1012,7 @@ mod tests {
             &config.target_lang,
         )
         .unwrap();
-        let worker = TranslationWorker::new(
-            engine,
-            cache.clone(),
-            config,
-            Glossary::default(),
-        );
+        let worker = TranslationWorker::new(engine, cache.clone(), config, Glossary::default());
 
         assert!(worker.translate_group(&paragraphs).await.is_err());
         server.join().unwrap();
@@ -1083,5 +1075,4 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("翻译批次已停止"));
     }
-
 }

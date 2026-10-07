@@ -2192,7 +2192,10 @@ mod tests {
             target_lang_code: "ar-EG".into(),
             ..Default::default()
         };
-        assert_eq!(target_direction(&config, Some("ar-EG")).as_deref(), Some("rtl"));
+        assert_eq!(
+            target_direction(&config, Some("ar-EG")).as_deref(),
+            Some("rtl")
+        );
         assert_eq!(
             resolve_href("OEBPS/content.opf", "Text/chapter%201.xhtml?q=1#x"),
             "OEBPS/Text/chapter 1.xhtml"
