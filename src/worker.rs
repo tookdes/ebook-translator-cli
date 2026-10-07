@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use rand::RngExt;
+use regex::Regex;
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::{
