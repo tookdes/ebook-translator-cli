@@ -359,14 +359,8 @@ impl TranslationWorker {
         self.translate_paragraph_inner(paragraph).await
     }
 
-    async fn translate_paragraph_inner(
-        &self,
-        paragraph: &Paragraph,
-    ) -> Result<TranslationOutcome> {
-        let mut last_error = match self
-            .translate_paragraph_with(&self.engine, paragraph)
-            .await
-        {
+    async fn translate_paragraph_inner(&self, paragraph: &Paragraph) -> Result<TranslationOutcome> {
+        let mut last_error = match self.translate_paragraph_with(&self.engine, paragraph).await {
             Ok(translation) => return Ok(translation),
             Err(error) => error,
         };
@@ -420,11 +414,7 @@ impl TranslationWorker {
         })
     }
 
-    async fn translate_piece_with(
-        &self,
-        runtime: &EngineRuntime,
-        source: &str,
-    ) -> Result<String> {
+    async fn translate_piece_with(&self, runtime: &EngineRuntime, source: &str) -> Result<String> {
         let original = self.glossary.apply(source);
         let has_markup = source.contains("{{etm_");
         let has_glossary = original.contains("{{etg_");
@@ -501,7 +491,9 @@ impl TranslationWorker {
                 Err(error) => {
                     let kind = classify_error(&error);
                     let allowed = match kind {
-                        ErrorKind::Permanent | ErrorKind::ContextOverflow | ErrorKind::Truncated => 1,
+                        ErrorKind::Permanent
+                        | ErrorKind::ContextOverflow
+                        | ErrorKind::Truncated => 1,
                         ErrorKind::Empty => config.max_retries.min(2),
                         _ => config.max_retries,
                     }
@@ -607,7 +599,11 @@ fn split_protected_text(value: &str) -> Option<(String, String)> {
         .find_iter(value)
         .map(|found| found.start()..found.end())
         .collect::<Vec<_>>();
-    let safe = |index: usize| !ranges.iter().any(|range| range.start < index && index < range.end);
+    let safe = |index: usize| {
+        !ranges
+            .iter()
+            .any(|range| range.start < index && index < range.end)
+    };
 
     let target_char = value.chars().count() / 2;
     let target_byte = value
@@ -632,7 +628,8 @@ fn split_protected_text(value: &str) -> Option<(String, String)> {
         if index <= min_byte || index >= max_byte || !safe(index) {
             continue;
         }
-        if ch.is_whitespace() || matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；') {
+        if ch.is_whitespace() || matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；')
+        {
             let split = index + ch.len_utf8();
             if safe(split) {
                 let distance = split.abs_diff(target_byte);
