@@ -6,7 +6,7 @@
     "cache_enabled": true,
     "cache_dir": "~/.cache/ebook-translator",
     "merge_enabled": true,
-    "merge_length": 300000,
+    "merge_length": 100000,
     "translation_position": "below",
     "translation_style": "",
     "column_gap": {
