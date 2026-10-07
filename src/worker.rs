@@ -24,6 +24,7 @@ use crate::{
 enum ErrorKind {
     Permanent,
     RateLimit,
+    ContextOverflow,
     Truncated,
     Empty,
     Transient,
@@ -355,17 +356,15 @@ impl TranslationWorker {
     }
 
     async fn translate_paragraph(&self, paragraph: &Paragraph) -> Result<TranslationOutcome> {
-        let original = self.glossary.apply(&paragraph.original);
-        self.translate_paragraph_inner(paragraph, &original).await
+        self.translate_paragraph_inner(paragraph).await
     }
 
     async fn translate_paragraph_inner(
         &self,
         paragraph: &Paragraph,
-        original: &str,
     ) -> Result<TranslationOutcome> {
         let mut last_error = match self
-            .translate_paragraph_with(&self.engine, paragraph, original)
+            .translate_paragraph_with(&self.engine, paragraph)
             .await
         {
             Ok(translation) => return Ok(translation),
@@ -377,10 +376,7 @@ impl TranslationWorker {
                 index + 1,
                 index + 2
             ));
-            match self
-                .translate_paragraph_with(fallback, paragraph, original)
-                .await
-            {
+            match self.translate_paragraph_with(fallback, paragraph).await {
                 Ok(translation) => return Ok(translation),
                 Err(error) => last_error = error,
             }
@@ -392,14 +388,50 @@ impl TranslationWorker {
         &self,
         runtime: &EngineRuntime,
         paragraph: &Paragraph,
-        original: &str,
     ) -> Result<TranslationOutcome> {
-        let has_markup = paragraph.original.contains("{{etm_");
+        let mut pending = VecDeque::from([paragraph.original.clone()]);
+        let mut translated_parts = Vec::new();
+
+        while let Some(piece) = pending.pop_front() {
+            match self.translate_piece_with(runtime, &piece).await {
+                Ok(translated) => translated_parts.push(translated),
+                Err(error) if classify_error(&error) == ErrorKind::ContextOverflow => {
+                    let Some((left, right)) = split_protected_text(&piece) else {
+                        return Err(error);
+                    };
+                    self.message(format!(
+                        "  单段超过模型上下文（{} 字符），拆分为 {}+{} 字符后重试",
+                        piece.chars().count(),
+                        left.chars().count(),
+                        right.chars().count()
+                    ));
+                    pending.push_front(right);
+                    pending.push_front(left);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let text = translated_parts.join("\n");
+        let text = accept_markup_translation(&paragraph.original, &text)?;
+        Ok(TranslationOutcome {
+            text,
+            engine_name: runtime.engine.name.clone(),
+        })
+    }
+
+    async fn translate_piece_with(
+        &self,
+        runtime: &EngineRuntime,
+        source: &str,
+    ) -> Result<String> {
+        let original = self.glossary.apply(source);
+        let has_markup = source.contains("{{etm_");
         let has_glossary = original.contains("{{etg_");
         let prompt = protected_prompt(self.prompt_for(&runtime.engine), has_markup, has_glossary);
         for attempt in 0..=usize::from(has_markup || has_glossary) {
-            let result = self.translate_one_with(runtime, original, &prompt).await?;
-            let restored = match self.glossary.restore(original, result.trim()) {
+            let result = self.translate_one_with(runtime, &original, &prompt).await?;
+            let restored = match self.glossary.restore(&original, result.trim()) {
                 Ok(restored) => restored,
                 Err(error) if attempt == 0 => {
                     self.message(format!("  模型损坏术语占位符，自动重试一次: {error}"));
@@ -407,13 +439,8 @@ impl TranslationWorker {
                 }
                 Err(error) => return Err(error),
             };
-            match accept_markup_translation(&paragraph.original, &restored) {
-                Ok(translation) => {
-                    return Ok(TranslationOutcome {
-                        text: translation,
-                        engine_name: runtime.engine.name.clone(),
-                    });
-                }
+            match accept_markup_translation(source, &restored) {
+                Ok(translation) => return Ok(translation),
                 Err(error) if attempt == 0 && has_markup => {
                     self.message(format!("  模型损坏 HTML 占位符，自动重试一次: {error}"));
                 }
@@ -474,7 +501,7 @@ impl TranslationWorker {
                 Err(error) => {
                     let kind = classify_error(&error);
                     let allowed = match kind {
-                        ErrorKind::Permanent | ErrorKind::Truncated => 1,
+                        ErrorKind::Permanent | ErrorKind::ContextOverflow | ErrorKind::Truncated => 1,
                         ErrorKind::Empty => config.max_retries.min(2),
                         _ => config.max_retries,
                     }
@@ -570,6 +597,65 @@ fn merge_groups(paragraphs: &[Paragraph], enabled: bool, limit: usize) -> Vec<Ve
     groups
 }
 
+fn split_protected_text(value: &str) -> Option<(String, String)> {
+    if value.chars().count() < 2 {
+        return None;
+    }
+
+    let protected = Regex::new(r"\{\{et[mg]_[^{}]+\}\}").ok()?;
+    let ranges = protected
+        .find_iter(value)
+        .map(|found| found.start()..found.end())
+        .collect::<Vec<_>>();
+    let safe = |index: usize| !ranges.iter().any(|range| range.start < index && index < range.end);
+
+    let target_char = value.chars().count() / 2;
+    let target_byte = value
+        .char_indices()
+        .nth(target_char)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len() / 2);
+    let min_byte = value
+        .char_indices()
+        .nth(value.chars().count() / 4)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let max_byte = value
+        .char_indices()
+        .nth(value.chars().count() * 3 / 4)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len());
+
+    let mut preferred = None;
+    let mut preferred_distance = usize::MAX;
+    for (index, ch) in value.char_indices() {
+        if index <= min_byte || index >= max_byte || !safe(index) {
+            continue;
+        }
+        if ch.is_whitespace() || matches!(ch, '.' | '!' | '?' | ';' | '。' | '！' | '？' | '；') {
+            let split = index + ch.len_utf8();
+            if safe(split) {
+                let distance = split.abs_diff(target_byte);
+                if distance < preferred_distance {
+                    preferred = Some(split);
+                    preferred_distance = distance;
+                }
+            }
+        }
+    }
+
+    let split = preferred.or_else(|| {
+        value
+            .char_indices()
+            .map(|(index, _)| index)
+            .filter(|&index| index > 0 && index < value.len() && safe(index))
+            .min_by_key(|&index| index.abs_diff(target_byte))
+    })?;
+
+    let (left, right) = value.split_at(split);
+    (!left.is_empty() && !right.is_empty()).then(|| (left.to_owned(), right.to_owned()))
+}
+
 fn classify_error(error: &anyhow::Error) -> ErrorKind {
     if let Some(api) = error.chain().find_map(|x| x.downcast_ref::<ApiError>()) {
         if api.status == Some(429) {
@@ -580,6 +666,20 @@ fn classify_error(error: &anyhow::Error) -> ErrorKind {
         }
     }
     let text = error.to_string().to_lowercase();
+    if [
+        "exceeds the available context size",
+        "maximum context length",
+        "context length exceeded",
+        "context window",
+        "too many tokens",
+        "上下文长度",
+        "上下文窗口",
+    ]
+    .iter()
+    .any(|x| text.contains(x))
+    {
+        return ErrorKind::ContextOverflow;
+    }
     if [
         "输出被截断",
         "stop_reason=max_tokens",
@@ -708,6 +808,17 @@ mod tests {
             classify_error(&anyhow!("API 输出被截断 (finish_reason=length)")),
             ErrorKind::Truncated
         );
+        assert_eq!(
+            classify_error(&anyhow!(
+                "HTTP 400: request (71971 tokens) exceeds the available context size (2048 tokens)"
+            )),
+            ErrorKind::ContextOverflow
+        );
+        let protected = "hello {{etm_o_00000}}world{{etm_c_00000}}. next sentence";
+        let (left, right) = split_protected_text(protected).unwrap();
+        assert_eq!(format!("{left}{right}"), protected);
+        assert!(!left.ends_with("{{etm_o_"));
+        assert!(!right.starts_with("00000}}"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
