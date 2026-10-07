@@ -1,0 +1,33 @@
+name: one-shot-format
+
+on:
+  push:
+    branches: ["fix/epubcheck-resume-merge"]
+    paths:
+      - ".github/workflows/format-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/epubcheck-resume-merge
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt
+      - name: Commit rustfmt output
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src
+          git commit -m "style: apply rustfmt"
+          git push origin HEAD:fix/epubcheck-resume-merge
