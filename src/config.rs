@@ -355,7 +355,9 @@ impl Config {
             bail!("column_gap 数值必须大于 0，percentage 不能超过 100");
         }
         if !self.allow_prompt_without_target_lang && !self.prompt.contains("<tlang>") {
-            bail!("prompt 必须包含 <tlang>；如需自行在 prompt 中固定目标语言，请显式设置 allow_prompt_without_target_lang=true");
+            bail!(
+                "prompt 必须包含 <tlang>；如需自行在 prompt 中固定目标语言，请显式设置 allow_prompt_without_target_lang=true"
+            );
         }
         if !self.target_lang_code.is_empty()
             && !Regex::new(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")?
@@ -404,7 +406,9 @@ impl Config {
                     .as_ref()
                     .is_some_and(|prompt| !prompt.contains("<tlang>"))
             {
-                bail!("引擎配置 {name}.prompt 必须包含 <tlang>；如需自行在 prompt 中固定目标语言，请显式设置 allow_prompt_without_target_lang=true");
+                bail!(
+                    "引擎配置 {name}.prompt 必须包含 <tlang>；如需自行在 prompt 中固定目标语言，请显式设置 allow_prompt_without_target_lang=true"
+                );
             }
             if !cfg.request_timeout.is_finite()
                 || cfg.request_timeout <= 0.0
