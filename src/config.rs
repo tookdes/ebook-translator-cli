@@ -144,6 +144,7 @@ pub struct Config {
     pub source_lang: String,
     pub target_lang: String,
     pub prompt: String,
+    pub allow_prompt_without_target_lang: bool,
     pub cache_enabled: bool,
     pub cache_dir: PathBuf,
     pub merge_enabled: bool,
@@ -196,6 +197,7 @@ impl Default for Config {
             source_lang: "English".into(),
             target_lang: "Chinese".into(),
             prompt: DEFAULT_PROMPT.into(),
+            allow_prompt_without_target_lang: false,
             cache_enabled: true,
             cache_dir: default_cache_dir(),
             merge_enabled: true,
@@ -352,8 +354,8 @@ impl Config {
         if !(1..=100).contains(&self.column_gap.percentage) || self.column_gap.space_count == 0 {
             bail!("column_gap 数值必须大于 0，percentage 不能超过 100");
         }
-        if !self.prompt.contains("<tlang>") {
-            bail!("prompt 必须包含 <tlang>");
+        if !self.allow_prompt_without_target_lang && !self.prompt.contains("<tlang>") {
+            bail!("prompt 必须包含 <tlang>；如需自行在 prompt 中固定目标语言，请显式设置 allow_prompt_without_target_lang=true");
         }
         if !self.target_lang_code.is_empty()
             && !Regex::new(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")?
@@ -396,12 +398,13 @@ impl Config {
             if !matches!(cfg.sampling.as_str(), "temperature" | "top_p") {
                 bail!("引擎配置 {name}.sampling 必须是 temperature 或 top_p");
             }
-            if cfg
-                .prompt
-                .as_ref()
-                .is_some_and(|prompt| !prompt.contains("<tlang>"))
+            if !self.allow_prompt_without_target_lang
+                && cfg
+                    .prompt
+                    .as_ref()
+                    .is_some_and(|prompt| !prompt.contains("<tlang>"))
             {
-                bail!("引擎配置 {name}.prompt 必须包含 <tlang>");
+                bail!("引擎配置 {name}.prompt 必须包含 <tlang>；如需自行在 prompt 中固定目标语言，请显式设置 allow_prompt_without_target_lang=true");
             }
             if !cfg.request_timeout.is_finite()
                 || cfg.request_timeout <= 0.0
@@ -481,6 +484,7 @@ mod tests {
         assert_eq!(Config::default().engine_config(None).temperature, Some(0.3));
         assert!(Config::default().merge_enabled);
         assert_eq!(Config::default().merge_length, 100_000);
+        assert!(!Config::default().allow_prompt_without_target_lang);
 
         let passthrough: Config = serde_json::from_str(
             r#"{"engines":{"openai":{"extra_body":{"thinking":{"type":"disabled"},"enable_thinking":false}}}}"#,
@@ -512,6 +516,35 @@ mod tests {
             },
         );
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn target_lang_placeholder_escape_hatch_is_explicit() {
+        let mut cfg = Config {
+            prompt: "Translate everything into Simplified Chinese.".into(),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        cfg.allow_prompt_without_target_lang = true;
+        cfg.validate().unwrap();
+
+        cfg.engines.insert(
+            "openai".into(),
+            EngineConfig {
+                prompt: Some("Always answer with a Simplified Chinese translation.".into()),
+                ..Default::default()
+            },
+        );
+        cfg.validate().unwrap();
+
+        cfg.allow_prompt_without_target_lang = false;
+        cfg.prompt = DEFAULT_PROMPT.into();
+        assert!(cfg.validate().is_err());
+
+        cfg.engines.get_mut("openai").unwrap().prompt =
+            Some("Translate the content to <tlang>.".into());
+        cfg.validate().unwrap();
     }
 
     #[test]

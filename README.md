@@ -103,6 +103,7 @@ ebook-translator 输入 [输出] [选项]
     "engine": "openai",
     "source_lang": "English",
     "target_lang": "Chinese",
+    "allow_prompt_without_target_lang": false,
     "engines": {
         "openai": {
             "api_key": "sk-你的密钥",
@@ -117,6 +118,8 @@ ebook-translator 输入 [输出] [选项]
 ```
 
 完整配置见 `config.example.json`。支持 `openai`（兼容所有 OpenAI 格式）、`claude`、`deepseek`。
+
+默认要求全局 `prompt` 以及引擎级自定义 `prompt` 包含 `<tlang>`，运行时会替换为 `target_lang`；`<slang>` 可省略。如果自定义 prompt 已经自行固定目标语言，或目标语言由服务端 system prompt 等机制保证，可显式设置 `"allow_prompt_without_target_lang": true` 跳过该校验。开启后，仍然可以继续使用 `<tlang>`，其替换行为不变。
 
 `openai.base_url` 可以填网关根地址（如 `https://example.com/v1`），也可以直接填完整端点（如 `https://example.com/v1/chat/completions`）；程序会避免重复拼接路径。自定义兼容端点可以把 `model` 留空，程序不会强行填默认模型。
 
