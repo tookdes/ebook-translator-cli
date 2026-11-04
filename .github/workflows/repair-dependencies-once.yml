@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "Cargo.toml"
+      - "src/epub.rs"
       - ".github/workflows/repair-dependencies-once.yml"
 
 permissions:

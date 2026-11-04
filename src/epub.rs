@@ -148,8 +148,8 @@ pub fn extract_from_epub(
     let rules = Rules::new(config)?;
     let names = archive
         .file_names()
-        .map(str::to_owned)
-        .collect::<HashSet<_>>();
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
     let mut elements = Vec::new();
 
     let metadata = extract_metadata(&opf, &opf_path, config)?;
@@ -246,8 +246,8 @@ pub fn write_translated_epub(
     let rules = Rules::new(config)?;
     let names = archive
         .file_names()
-        .map(str::to_owned)
-        .collect::<HashSet<_>>();
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
     let nav = package
         .manifest
         .iter()
@@ -324,7 +324,7 @@ pub fn write_translated_epub(
     let mut writer = ZipWriter::new(temp.reopen()?);
     for index in 0..archive.len() {
         let member = archive.by_index(index)?;
-        let name = member.name().to_owned();
+        let name = member.name()?.into_owned();
         if let Some(data) = modified.remove(&name) {
             let options = SimpleFileOptions::default()
                 .compression_method(member.compression())
@@ -526,11 +526,12 @@ fn validate_archive(archive: &mut ZipArchive<File>) -> Result<()> {
     let mut names = HashSet::new();
     for index in 0..archive.len() {
         let member = archive.by_index(index)?;
-        if !names.insert(member.name().to_owned()) {
-            bail!("EPUB 包含重复成员: {}", member.name());
+        let name = member.name()?.into_owned();
+        if !names.insert(name.clone()) {
+            bail!("EPUB 包含重复成员: {name}");
         }
         if member.size() > MAX_MEMBER_SIZE {
-            bail!("EPUB 成员过大: {}", member.name());
+            bail!("EPUB 成员过大: {name}");
         }
         total = total.saturating_add(member.size());
         if total > MAX_TOTAL_SIZE {
@@ -540,7 +541,7 @@ fn validate_archive(archive: &mut ZipArchive<File>) -> Result<()> {
             && member.compressed_size() > 0
             && member.size() / member.compressed_size() > MAX_COMPRESSION_RATIO
         {
-            bail!("EPUB 成员压缩比异常: {}", member.name());
+            bail!("EPUB 成员压缩比异常: {name}");
         }
     }
     Ok(())
